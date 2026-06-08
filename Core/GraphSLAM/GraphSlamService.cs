@@ -4,6 +4,8 @@ using UnityEngine;
 using static MatrixVectorUtilities;
 using static PoseMatrix4x4;
 
+public enum LoopClosureFinder { KNodeGapBased, TimeAndConeBased };
+
 public class GraphSlamService
 {
     private int nodeCounter;
@@ -22,6 +24,8 @@ public class GraphSlamService
     private float minDeltaRotation;
 
     private List<Vector3> globalUpdatedMap;
+    private List<(int from, int to)> closureEdgesWorldPositions;
+    private HashSet<(int from, int to)> hashLoopClosureFounded;
 
     private float[,] AccumulateedTRelativeForNodeInsertion;
 
@@ -38,6 +42,8 @@ public class GraphSlamService
         this.minDeltaTranslation = minDeltaT;
         globalUpdatedMap = new List<Vector3>();
         this.AccumulateedTRelativeForNodeInsertion = Identity4();
+        this.closureEdgesWorldPositions = new List<(int from, int to)>();
+        this.hashLoopClosureFounded = new HashSet<(int, int)>();
     }
 
     public void insertNode(PoseNode node)
@@ -86,18 +92,21 @@ public class GraphSlamService
         AccumulateedTRelativeForNodeInsertion = Identity4();
     }
 
-    public void updateGraphSLAMWithClosureEdge(PoseNode candidate, float[,] deltaTCandidate)
+    public bool updateGraphSLAMWithClosureEdge(PoseNode candidate, float[,] deltaTCandidate)
     {
         // deltaTCandidate = T_candidate^-1 * T_newNode (l'ICP allinea i punti di newNode su candidate).
         // L'ottimizzatore si aspetta z_ij = T_from^-1 * T_to, quindi l'edge deve andare
         // da candidate (from) a newNode (to) per rispettare la convenzione del residuo.
-        PoseEdge closureEdge = new PoseEdge(candidate.PoseID(), newNode.PoseID(), deltaTCandidate, Identity6());
-        insertEdge(closureEdge);
-    }
-
-    public List<PoseNode> getLoopClosureCandidates(int k, float loopClosureRadius)
-    {
-        return poseGraph.SearchLoopClosureCandidates(newNode, k, loopClosureRadius);
+        // Ritorna true solo se l'edge e' stato effettivamente aggiunto (coppia non gia' chiusa):
+        // serve all'orchestrator per non ri-ottimizzare a vuoto sui trigger ripetuti.
+        if(hashLoopClosureFounded.Add((candidate.PoseID(), newNode.PoseID())))
+        {
+            PoseEdge closureEdge = new PoseEdge(candidate.PoseID(), newNode.PoseID(), deltaTCandidate, Identity6());
+            insertEdge(closureEdge);
+            closureEdgesWorldPositions.Add((candidate.PoseID(), newNode.PoseID()));
+            return true;
+        }
+        return false;
     }
 
     internal float[,] GetInitialGuessForCandidate(PoseNode candidate)
@@ -140,12 +149,25 @@ public class GraphSlamService
         return poseGraph.Nodes();
     }
 
+    public List<PoseNode> getGraphNodesWithIDUpperBound(int k)
+    {
+        return poseGraph.getGraphNodesWithIDUpperBound(k);
+    }
+
     public PoseNode getNewNode()
     {
         return newNode;
     }
 
-    internal bool checkIfMoovedSinceLastNode(float[,] relativeICP)
+    // Moto relativo accumulato dall'ultimo nodo inserito (T_lastNode^-1 * T_robotCorrente).
+    // Serve al re-anchoring post-ottimizzazione quando il trigger scatta mentre il robot si e'
+    // gia' mosso oltre l'ultimo nodo (caso tipico del trigger temporale TimeAndCone).
+    public float[,] getAccumulatedRelativeSinceLastNode()
+    {
+        return AccumulateedTRelativeForNodeInsertion;
+    }
+
+    public bool checkIfMoovedSinceLastNode(float[,] relativeICP)
     {
         AccumulateedTRelativeForNodeInsertion = productSquareMatrix4(AccumulateedTRelativeForNodeInsertion, relativeICP);
 
@@ -156,4 +178,21 @@ public class GraphSlamService
         bool hasMooved = getNormV3(measuredTraslation) > minDeltaTranslation || getNormV3(measuredRotation) > minDeltaRotation;
         return hasMooved;
     }
+
+    public List<(Vector3 from, Vector3 to)> getClosureEdgeVector3Couples()
+    {
+        List<(int from, int to)> idCouplesList = getClosureEdgesIDCouples();
+        List<(Vector3 from, Vector3 to)> result = new List<(Vector3, Vector3)>();
+        foreach((int from, int to) couple in idCouplesList)
+        {
+            result.Add((poseGraph.getNode(couple.from).getPoseTAsV3(), poseGraph.getNode(couple.to).getPoseTAsV3()));
+        }
+        return result;
+    }
+
+    public List<(int from, int to)> getClosureEdgesIDCouples()
+    {
+        return closureEdgesWorldPositions;
+    }
+
 }

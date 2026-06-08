@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using static MatrixVectorUtilities;
 using UnityEngine;
+using System;
 
 public class PoseGraph
 {
@@ -43,24 +44,19 @@ public class PoseGraph
         return nodeList.Count;
     }
 
-    public List<PoseNode> SearchLoopClosureCandidates(PoseNode currentNode, int k,float loopClosureRadius)
+    public List<PoseNode> getGraphNodesWithIDUpperBound(int upperBound)
     {
-        List<PoseNode> returnList = new List<PoseNode>();
-        foreach(PoseNode node in nodeList.Values)
+        List<PoseNode> result = new List<PoseNode>();
+
+        foreach (PoseNode node in nodeList.Values)
         {
-            if (currentNode.PoseID() - node.PoseID() >= k)
+            if (node.PoseID() <= upperBound)
             {
-                //Debug.Log($"Candidate node is k={k} steps far from the current node, calcualating distance...");
-                float[] distanceVector = new float[3] { currentNode.PoseT()[0, 3] - node.PoseT()[0, 3], currentNode.PoseT()[1, 3] - node.PoseT()[1, 3], currentNode.PoseT()[2, 3] - node.PoseT()[2, 3] };
-                if (getNormV3(distanceVector) <=loopClosureRadius)
-                {
-                    //Debug.Log($"Distance is {getNormV3(distanceVector)} and is smaller than loop closure radius: {loopClosureRadius}, adding node to candidates...");
-                    returnList.Add(node);
-                }
+                result.Add(node);
             }
         }
-        return returnList;
+        return result;
     }
-    
+
 
 }

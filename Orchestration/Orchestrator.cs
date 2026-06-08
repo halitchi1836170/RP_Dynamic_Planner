@@ -44,6 +44,10 @@ public class Orchestrator : MonoBehaviour
     public int maxCGIterations = 100;
     public float graphSlamOptimizerConvergenceThreshold = 1e-6f;
     public float CGConvergenceThreshold = 1e-6f;
+    public LoopClosureFinder loopClosureMode = LoopClosureFinder.TimeAndConeBased;
+    public float maxRadiusLoopClosureFinder = 3.0f;
+    public float halfConeAngleLoopClosureFinder = 45.0f;
+    public int secondsFrequencyLoopClosureFinder = 5;
 
     public string ODOMETRYFILEDS = "FOLLOWING ODOMETRY FILEDS";
     public float angularVelocityThreshold = 0.001f;
@@ -71,7 +75,8 @@ public class Orchestrator : MonoBehaviour
     private GraphSlamService graphSlamService;
     private PublishingService publisherService;
     private OdometryService odometryService;
-    private List<(Vector3 from, Vector3 to)> closureEdgesWorldPositions = new List<(Vector3, Vector3)>();
+    private LoopClosureFinderService loopClosureFinderService;
+
 
 
 
@@ -109,7 +114,7 @@ public class Orchestrator : MonoBehaviour
         icpService = new ICPService(icpMode, deltaHuber, maxIteration, maxDistance, convergenceThreshold, voxelSize, nPosesPath, marrtionLaserLinkTransform, lidar, graphSlamService);
         publisherService = new PublishingService();
         odometryService = new OdometryService(angularVelocityThreshold, wheelVelocityThreshold, odometryFrequency, articulationBodiesRefs, publishLastNOdometryPoses, NOdometryLastPoses);
-
+        loopClosureFinderService = new LoopClosureFinderService(halfConeAngleLoopClosureFinder, k_midDeltaIDBetweenCandidates, secondsFrequencyLoopClosureFinder, maxRadiusLoopClosureFinder, thresholdLoopClosure);
 
 
         //------------------REGISTRAZIONE EVENTI
@@ -169,7 +174,7 @@ public class Orchestrator : MonoBehaviour
 
         (Vector3 worldDelta, Queue<Vector3> icpWorldPositions, List<Vector3> transformedWorldPointsList) updatedWorld = icpService.ScanCompletedRunOneICP();
 
-        float[,] TWorldICP = icpService.getTWorldICP();
+        float[,] TWorldICP = icpService.getTWorldICP(); 
         float[,] TRelativeICP = icpService.getTRelativeICP();
 
         List<Vector3> sourceLocalTreeListOfPoints = icpService.getSourceLocalTreeListOfPoints();
@@ -183,62 +188,81 @@ public class Orchestrator : MonoBehaviour
             //Debug.Log("Inserted new node in the Graph SLAM");
             publisherService.PublishGraphNodes( icpService.ICPToWorldPositionEnumerableNodes(graphSlamService.getGraphNodes()), graphSlamNodesTopic);
 
-            int nodeCounter = graphSlamService.getNodeCounter();
-            //bool da studiare per far sì che SearchLoopClosure venga chiamato solo quando effettivamente il lidar dopo K iterazioni ha ritrovato punti già noti, magari presenti in un qualche dizionario
-            //bool someConditionToBeFiguredOut = true;
-            bool someConditionToBeFiguredOut = nodeCounter % k_tryLoopClosure == 0;
-
-            if (someConditionToBeFiguredOut)
+            // Modalità KNodeGap: il trigger è legato alla creazione di un nuovo nodo (ogni k nodi).
+            if (loopClosureMode == LoopClosureFinder.KNodeGapBased && graphSlamService.getNodeCounter() % k_tryLoopClosure == 0)
             {
-                Debug.Log($"Trying to find a new closure...");
-                //publisherService.PublishLoopClosureCircle( icpService.ICPToWorldPosition(TWorldICP[0, 3], TWorldICP[1, 3], TWorldICP[2, 3]), loopClosureRadius, loopClosureCircleTopic);
-
-                List<PoseNode> candidates = graphSlamService.getLoopClosureCandidates(k_midDeltaIDBetweenCandidates, loopClosureRadius);
-                List<Vector3> sourceScannedPoints = graphSlamService.getNewNodeScannedPoints();
-
-                int closureEdges = 0;
-                Vector3 currentWorldPos = icpService.ICPToWorldPosition(TWorldICP[0, 3], TWorldICP[1, 3], TWorldICP[2, 3]);
-                foreach (PoseNode candidate in candidates)
-                {
-                    float[,] initialGuess = graphSlamService.GetInitialGuessForCandidate(candidate);
-                    float[,] deltaTCandidate = icpService.SolveInverseICPProblem(initialGuess, candidate, sourceScannedPoints);
-                    float[] logError = LogMap(deltaTCandidate);
-
-                    if (getNorm(logError) < thresholdLoopClosure)
-                    {
-                        Debug.Log($"Loop closure found, adding it to the graph slam...");
-                        graphSlamService.updateGraphSLAMWithClosureEdge(candidate, deltaTCandidate);
-                        Vector3 candidateWorldPos = icpService.ICPToWorldPosition(candidate.PoseT()[0, 3], candidate.PoseT()[1, 3], candidate.PoseT()[2, 3]);
-                        closureEdgesWorldPositions.Add((currentWorldPos, candidateWorldPos));
-                        closureEdges++;
-                    }
-                }
-
-                if (closureEdges > 0)
-                {
-                    Debug.Log($"Added {closureEdges} loop closures, optimizing...");
-                    graphSlamService.OptimizeGraph();
-                    // Re-anchor dell'accumulatore ICP alla posa ottimizzata del nodo più recente:
-                    // senza questo, i nodi successivi nascono sulla vecchia catena raw e l'edge di
-                    // odometria diventa incoerente con le pose ottimizzate → la prossima ottimizzazione
-                    // parte da un dx enorme e distorce il grafo. TRelativeICP resta intatto (è relativo).
-                    icpService.setTWorldICP(graphSlamService.getNewNode().PoseT());
-                    publisherService.PublishGraphNodes(icpService.ICPToWorldPositionEnumerableNodes(graphSlamService.getGraphNodes()), graphSlamNodesTopic);
-                    graphSlamService.updateGlobalScannedPointsAfterOptimization();
-                    publisherService.PublishUpdatedGlobalPointCloudMap( icpService.ICPToWorldPositionListVectors(graphSlamService.getUpdatedGlobalMapPointCloud()) , graphSlamGlobalpointCloudTopic);
-                    publisherService.PublishLoopClosureEdges(closureEdgesWorldPositions, loopClosureEdgesTopic);
-                }
-
+                TryLoopClosure();
             }
 
             graphSlamService.updateLastNode();
+        }
 
+        // Modalità TimeAndCone: trigger temporale, controllato ad OGNI scan (anche da fermo, quando
+        // non si crea alcun nodo) -> permette di puntare i nodi già creati e aspettare l'aggancio.
+        // La guardia getNewNode() != null evita l'NPE finché esiste solo il nodo 0 (che non setta newNode);
+        // è messa prima del timer così, se non possiamo agire, non consumiamo/resettiamo il timer.
+        if (loopClosureMode == LoopClosureFinder.TimeAndConeBased
+            && graphSlamService.getNewNode() != null
+            && loopClosureFinderService.itsTimeToFindLoopClosure())
+        {
+            TryLoopClosure();
         }
 
         publisherService.PublishICPPath(updatedWorld.icpWorldPositions, icpPathRosTopic);
 
         publisherService.PublishICPMap(updatedWorld.transformedWorldPointsList, icpMapRosTopic);
 
+    }
+
+    // Ricerca candidati -> ICP inverso -> aggiunta closure edges -> ottimizzazione + publish.
+    // Usa sempre il nodo più recente (getNewNode) come query, indipendentemente dal fatto che in
+    // questo scan sia stato creato un nuovo nodo: così funziona anche da robot fermo.
+    void TryLoopClosure()
+    {
+        Debug.Log($"Trying to find a new closure...");
+
+        int nodeCounter = graphSlamService.getNodeCounter();
+        float[,] TWorldICP = icpService.getTWorldICP();
+
+        List<PoseNode> candidates = loopClosureFinderService.getLoopClosureCandidates(loopClosureMode, graphSlamService.getNewNode(), graphSlamService.getGraphNodesWithIDUpperBound(nodeCounter - k_midDeltaIDBetweenCandidates));
+        List<Vector3> sourceScannedPoints = graphSlamService.getNewNodeScannedPoints();
+
+        int closureEdges = 0;
+        Vector3 currentWorldPos = icpService.ICPToWorldPosition(TWorldICP[0, 3], TWorldICP[1, 3], TWorldICP[2, 3]);
+        foreach (PoseNode candidate in candidates)
+        {
+            float[,] initialGuess = graphSlamService.GetInitialGuessForCandidate(candidate);
+            float[,] deltaTCandidate = icpService.SolveInverseICPProblem(initialGuess, candidate, sourceScannedPoints);
+            float[] logError = LogMap(deltaTCandidate);
+
+            if (getNorm(logError) < thresholdLoopClosure)
+            {
+                Vector3 candidateWorldPos = icpService.ICPToWorldPosition(candidate.PoseT()[0, 3], candidate.PoseT()[1, 3], candidate.PoseT()[2, 3]);
+                // Incrementa solo se l'edge è stato davvero aggiunto (coppia non già chiusa):
+                // sui trigger ripetuti da fermo evita di ri-ottimizzare a vuoto.
+                if (graphSlamService.updateGraphSLAMWithClosureEdge(candidate, deltaTCandidate))
+                {
+                    Debug.Log($"Loop closure found, adding it to the graph slam...");
+                    closureEdges++;
+                }
+            }
+        }
+
+        if (closureEdges > 0)
+        {
+            Debug.Log($"Added {closureEdges} loop closures, optimizing...");
+            graphSlamService.OptimizeGraph();
+            // Re-anchor dell'accumulatore ICP alla posa ottimizzata del nodo più recente.
+            // Va moltiplicato per il moto accumulato dall'ultimo nodo: se il trigger scatta mentre
+            // il robot si è già mosso oltre l'ultimo nodo (tipico in TimeAndCone), TWorldICP =
+            // T_newNode_opt * accumulatore preserva la posa corrente del robot. In KNodeGap
+            // l'accumulatore è Identity, quindi si riduce a getNewNode().PoseT().
+            icpService.setTWorldICP(productSquareMatrix4(graphSlamService.getNewNode().PoseT(), graphSlamService.getAccumulatedRelativeSinceLastNode()));
+            publisherService.PublishGraphNodes(icpService.ICPToWorldPositionEnumerableNodes(graphSlamService.getGraphNodes()), graphSlamNodesTopic);
+            graphSlamService.updateGlobalScannedPointsAfterOptimization();
+            publisherService.PublishUpdatedGlobalPointCloudMap( icpService.ICPToWorldPositionListVectors(graphSlamService.getUpdatedGlobalMapPointCloud()) , graphSlamGlobalpointCloudTopic);
+            publisherService.PublishLoopClosureEdges(graphSlamService.getClosureEdgeVector3Couples(), loopClosureEdgesTopic);
+        }
     }
 
 }

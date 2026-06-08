@@ -58,4 +58,9 @@ public class PoseNode
         return poseScannedPointsKDTree;
     }
 
+    public Vector3 getPoseTAsV3()
+    {
+        return new Vector3(PoseT()[0,3], PoseT()[1, 3], PoseT()[2, 3]);
+    }
+
 }
