@@ -440,4 +440,64 @@ public class PublishingService
         ROSConnection.GetOrCreateInstance().Publish(topic, msg);
     }
 
+    // Ventaglio/forbice del cono di ricerca loop closure, centrato sul robot (Unity world).
+    // Disegna i due raggi laterali a ±halfAngle e l'arco al raggio, sul piano orizzontale X-Z
+    // (il cono di ricerca è 2D, Y = verticale). apex/forward sono in Unity world.
+    public void PublishConeFan(Vector3 apex, Vector3 forwardWorld, float halfAngleDeg, float minRadius, float maxRadius, string topic, int arcSegments = 24, int pointsPerEdge = 20)
+    {
+        Vector3 fwd = new Vector3(forwardWorld.x, 0f, forwardWorld.z);
+        if (fwd.sqrMagnitude < 1e-12f) return;
+        fwd.Normalize();
+
+        Vector3 leftDir = Quaternion.AngleAxis(halfAngleDeg, Vector3.up) * fwd;
+        Vector3 rightDir = Quaternion.AngleAxis(-halfAngleDeg, Vector3.up) * fwd;
+
+        List<Vector3> pts = new List<Vector3>();
+        // due raggi laterali (dal vertice fino al raggio)
+        for (int i = 0; i <= pointsPerEdge; i++)
+        {
+            float t = maxRadius * i / pointsPerEdge;
+            pts.Add(apex + leftDir * t);
+            pts.Add(apex + rightDir * t);
+        }
+        // arco che chiude il ventaglio
+        for (int i = 0; i <= arcSegments; i++)
+        {
+            float a = Mathf.Lerp(-halfAngleDeg, halfAngleDeg, (float)i / arcSegments);
+            Vector3 dir = Quaternion.AngleAxis(a, Vector3.up) * fwd;
+            pts.Add(apex + dir * maxRadius);
+            pts.Add(apex + dir * minRadius);
+        }
+
+        uint pointStep = 12;
+        uint width = (uint)pts.Count;
+        byte[] data = new byte[pointStep * width];
+        for (int i = 0; i < pts.Count; i++)
+        {
+            var (rx, ry, rz) = UnityToRosPosition(pts[i].x, pts[i].y, pts[i].z);
+            int offset = i * (int)pointStep;
+            Array.Copy(BitConverter.GetBytes(rx), 0, data, offset, 4);
+            Array.Copy(BitConverter.GetBytes(ry), 0, data, offset + 4, 4);
+            Array.Copy(BitConverter.GetBytes(rz), 0, data, offset + 8, 4);
+        }
+
+        PointCloud2Msg msg = new PointCloud2Msg();
+        msg.header = getPointCloud2MsgHeader();
+        msg.height = 1;
+        msg.width = width;
+        msg.fields = new PointFieldMsg[]
+        {
+            new PointFieldMsg("x", 0, PointFieldMsg.FLOAT32, 1),
+            new PointFieldMsg("y", 4, PointFieldMsg.FLOAT32, 1),
+            new PointFieldMsg("z", 8, PointFieldMsg.FLOAT32, 1),
+        };
+        msg.is_bigendian = false;
+        msg.point_step = pointStep;
+        msg.row_step = pointStep * width;
+        msg.data = data;
+        msg.is_dense = true;
+
+        ROSConnection.GetOrCreateInstance().Publish(topic, msg);
+    }
+
 }

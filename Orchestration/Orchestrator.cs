@@ -32,22 +32,24 @@ public class Orchestrator : MonoBehaviour
     public string graphSlamNodesTopic = "/graph_slam/nodes";
     public string loopClosureCircleTopic = "/graph_slam/loop_closure_radius";
     public string loopClosureEdgesTopic = "/graph_slam/loop_closure_edges";
+    public string coneFanTopic = "/graph_slam/cone_fan";
 
     public string GRASLAMFIELDS = "FOLLOWING GRAPH SLAM FIELDS";
     public float minDeltaTranslation = 0.1f;
     public float minDeltaRotation = 0.5f;
     public int k_midDeltaIDBetweenCandidates = 15;
     public int k_tryLoopClosure = 10;
-    public float loopClosureRadius = 1.0f;
     public float thresholdLoopClosure = 0.5f;
     public int maxIterations = 50;
     public int maxCGIterations = 100;
     public float graphSlamOptimizerConvergenceThreshold = 1e-6f;
     public float CGConvergenceThreshold = 1e-6f;
     public LoopClosureFinder loopClosureMode = LoopClosureFinder.TimeAndConeBased;
-    public float maxRadiusLoopClosureFinder = 3.0f;
-    public float halfConeAngleLoopClosureFinder = 45.0f;
-    public int secondsFrequencyLoopClosureFinder = 5;
+    public float maxRadiusLoopClosureFinder = 0.5f;
+    public float halfConeAngleLoopClosureFinder = 30.0f;
+    public int secondsFrequencyLoopClosureFinder = 15;
+    public bool planarConstraintFlag = true;
+    private float huberDeltaGraphSlamOptimization = 0.5f;
 
     public string ODOMETRYFILEDS = "FOLLOWING ODOMETRY FILEDS";
     public float angularVelocityThreshold = 0.001f;
@@ -110,8 +112,8 @@ public class Orchestrator : MonoBehaviour
 
 
         //------------------INIZIALIZZAZIONE SERVIZI
-        graphSlamService = new GraphSlamService(maxIterations, maxCGIterations, graphSlamOptimizerConvergenceThreshold, CGConvergenceThreshold, minDeltaTranslation, minDeltaRotation);
-        icpService = new ICPService(icpMode, deltaHuber, maxIteration, maxDistance, convergenceThreshold, voxelSize, nPosesPath, marrtionLaserLinkTransform, lidar, graphSlamService);
+        graphSlamService = new GraphSlamService(maxIterations, maxCGIterations, graphSlamOptimizerConvergenceThreshold, CGConvergenceThreshold, minDeltaTranslation, minDeltaRotation, huberDeltaGraphSlamOptimization);
+        icpService = new ICPService(icpMode, deltaHuber, maxIteration, maxDistance, convergenceThreshold, voxelSize, nPosesPath, marrtionLaserLinkTransform, lidar, graphSlamService, planarConstraintFlag);
         publisherService = new PublishingService();
         odometryService = new OdometryService(angularVelocityThreshold, wheelVelocityThreshold, odometryFrequency, articulationBodiesRefs, publishLastNOdometryPoses, NOdometryLastPoses);
         loopClosureFinderService = new LoopClosureFinderService(halfConeAngleLoopClosureFinder, k_midDeltaIDBetweenCandidates, secondsFrequencyLoopClosureFinder, maxRadiusLoopClosureFinder, thresholdLoopClosure);
@@ -136,6 +138,7 @@ public class Orchestrator : MonoBehaviour
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(graphSlamNodesTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(loopClosureCircleTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(loopClosureEdgesTopic);
+        ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(coneFanTopic);
     }
 
     // Update is called once per frame
@@ -155,8 +158,14 @@ public class Orchestrator : MonoBehaviour
                 publisherService.PublishOdometryPath(odometryService.getUpdatedLastOdometryPoses(), odometryPathRosTopic);
             }
 
-            
 
+
+        }
+
+        // Ventaglio del cono di ricerca, centrato sul robot live, pubblicato ogni frame (solo in TimeAndCone).
+        if (loopClosureMode == LoopClosureFinder.TimeAndConeBased)
+        {
+            publisherService.PublishConeFan(marrtionLaserLinkTransform.position, marrtionLaserLinkTransform.forward, halfConeAngleLoopClosureFinder, thresholdLoopClosure, maxRadiusLoopClosureFinder, coneFanTopic);
         }
     }
 
@@ -184,7 +193,7 @@ public class Orchestrator : MonoBehaviour
 
         if (hasMoovedSinceLastNode)
         {
-            graphSlamService.updateGraphSLAMWithNewNode(TWorldICP, TRelativeICP, sourceLocalTreeListOfPoints, kdSourceTree);
+            graphSlamService.updateGraphSLAMWithNewNode(TWorldICP, sourceLocalTreeListOfPoints, kdSourceTree);
             //Debug.Log("Inserted new node in the Graph SLAM");
             publisherService.PublishGraphNodes( icpService.ICPToWorldPositionEnumerableNodes(graphSlamService.getGraphNodes()), graphSlamNodesTopic);
 
@@ -219,12 +228,19 @@ public class Orchestrator : MonoBehaviour
     // questo scan sia stato creato un nuovo nodo: così funziona anche da robot fermo.
     void TryLoopClosure()
     {
-        Debug.Log($"Trying to find a new closure...");
-
         int nodeCounter = graphSlamService.getNodeCounter();
         float[,] TWorldICP = icpService.getTWorldICP();
 
-        List<PoseNode> candidates = loopClosureFinderService.getLoopClosureCandidates(loopClosureMode, graphSlamService.getNewNode(), graphSlamService.getGraphNodesWithIDUpperBound(nodeCounter - k_midDeltaIDBetweenCandidates));
+        List<PoseNode> candidates = loopClosureFinderService.getLoopClosureCandidates(
+            loopClosureMode,
+            graphSlamService.getNewNode(),
+            graphSlamService.getGraphNodesWithIDUpperBound(nodeCounter - k_midDeltaIDBetweenCandidates),
+            marrtionLaserLinkTransform.position,
+            marrtionLaserLinkTransform.forward,
+            node => icpService.ICPToWorldPosition(node.PoseT()[0, 3], node.PoseT()[1, 3], node.PoseT()[2, 3]));
+
+        Debug.Log($"Trying to find a new closure, found {candidates.Count} candidates...");
+
         List<Vector3> sourceScannedPoints = graphSlamService.getNewNodeScannedPoints();
 
         int closureEdges = 0;
@@ -237,12 +253,12 @@ public class Orchestrator : MonoBehaviour
 
             if (getNorm(logError) < thresholdLoopClosure)
             {
+                Debug.Log($"Loop closure found, adding it to the graph slam...");
                 Vector3 candidateWorldPos = icpService.ICPToWorldPosition(candidate.PoseT()[0, 3], candidate.PoseT()[1, 3], candidate.PoseT()[2, 3]);
                 // Incrementa solo se l'edge è stato davvero aggiunto (coppia non già chiusa):
                 // sui trigger ripetuti da fermo evita di ri-ottimizzare a vuoto.
                 if (graphSlamService.updateGraphSLAMWithClosureEdge(candidate, deltaTCandidate))
                 {
-                    Debug.Log($"Loop closure found, adding it to the graph slam...");
                     closureEdges++;
                 }
             }
@@ -261,7 +277,7 @@ public class Orchestrator : MonoBehaviour
             publisherService.PublishGraphNodes(icpService.ICPToWorldPositionEnumerableNodes(graphSlamService.getGraphNodes()), graphSlamNodesTopic);
             graphSlamService.updateGlobalScannedPointsAfterOptimization();
             publisherService.PublishUpdatedGlobalPointCloudMap( icpService.ICPToWorldPositionListVectors(graphSlamService.getUpdatedGlobalMapPointCloud()) , graphSlamGlobalpointCloudTopic);
-            publisherService.PublishLoopClosureEdges(graphSlamService.getClosureEdgeVector3Couples(), loopClosureEdgesTopic);
+            publisherService.PublishLoopClosureEdges(icpService.ICPToWorldPositionPairs(graphSlamService.getClosureEdgeVector3Couples()), loopClosureEdgesTopic);
         }
     }
 

@@ -29,7 +29,9 @@ public class GraphSlamService
 
     private float[,] AccumulateedTRelativeForNodeInsertion;
 
-    public GraphSlamService(int maxIterationsNumber, int maxCGIterations, float graphSlamoptimizerThreshold, float CGConvergenceTrheshold, float minDeltaT, float minDeltaR)
+    private float huberDeltaGraphSlamOptimization;
+
+    public GraphSlamService(int maxIterationsNumber, int maxCGIterations, float graphSlamoptimizerThreshold, float CGConvergenceTrheshold, float minDeltaT, float minDeltaR, float huberDeltaGraphSlamOptimization)
     {
         nodeCounter = 0;
         edgeCounter = 0;
@@ -44,6 +46,7 @@ public class GraphSlamService
         this.AccumulateedTRelativeForNodeInsertion = Identity4();
         this.closureEdgesWorldPositions = new List<(int from, int to)>();
         this.hashLoopClosureFounded = new HashSet<(int, int)>();
+        this.huberDeltaGraphSlamOptimization = huberDeltaGraphSlamOptimization;
     }
 
     public void insertNode(PoseNode node)
@@ -80,7 +83,7 @@ public class GraphSlamService
         newNode = node;
     }
 
-    public void updateGraphSLAMWithNewNode(float[,] TWorldICP, float[,] TRelativeICP, List<Vector3> sourceLocalTreeListOfPoints, KDTree kdSourceTree)
+    public void updateGraphSLAMWithNewNode(float[,] TWorldICP, List<Vector3> sourceLocalTreeListOfPoints, KDTree kdSourceTree)
     {
         newNode = new PoseNode(TWorldICP, sourceLocalTreeListOfPoints, kdSourceTree);
         insertNode(newNode);
@@ -102,6 +105,7 @@ public class GraphSlamService
         if(hashLoopClosureFounded.Add((candidate.PoseID(), newNode.PoseID())))
         {
             PoseEdge closureEdge = new PoseEdge(candidate.PoseID(), newNode.PoseID(), deltaTCandidate, Identity6());
+            closureEdge.setLoopClosure(true);
             insertEdge(closureEdge);
             closureEdgesWorldPositions.Add((candidate.PoseID(), newNode.PoseID()));
             return true;
@@ -121,7 +125,7 @@ public class GraphSlamService
 
     public void OptimizeGraph()
     {
-        GraphSlamOptimizer graphOptimizer = new GraphSlamOptimizer(maxIterations, maxCGIterations, convergenceThreshold, convergenceCGThreshold, poseGraph);
+        GraphSlamOptimizer graphOptimizer = new GraphSlamOptimizer(maxIterations, maxCGIterations, convergenceThreshold, convergenceCGThreshold, poseGraph, huberDeltaGraphSlamOptimization);
         graphOptimizer.Optimize();
     }
 

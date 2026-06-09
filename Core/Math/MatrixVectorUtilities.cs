@@ -777,6 +777,55 @@ public class MatrixVectorUtilities
         return result;
     }
 
+    public static float[,] composeRByColumnVectors(float[] c1, float[] c2, float[] c3)
+    {
+        float[,] result = new float[3, 3];
+        if(c1.Length==3 && c2.Length==3 && c3.Length == 3)
+        {
+            result[0, 0] = c1[0];
+            result[1, 0] = c1[1];
+            result[2, 0] = c1[2];
+
+            result[0, 1] = c2[0];
+            result[1, 1] = c2[1];
+            result[2, 1] = c2[2];
+
+            result[0, 2] = c3[0];
+            result[1, 2] = c3[1];
+            result[2, 2] = c3[2];
+        }
+        return result;
+    }
+
+    // Proietta una posa SE(3) sul piano orizzontale (Y = verticale in Unity):
+    // azzera la traslazione verticale e livella la rotazione a solo-yaw attorno a Y.
+    // Usata sia per l'odometria (TWorldICP) sia per le misure di loop closure, così TUTTI
+    // gli edge del grafo restano planari e coerenti tra loro.
+    public static float[,] projectPoseToPlane(float[,] T)
+    {
+        float tx = T[0, 3];
+        float tz = T[2, 3];
+
+        // forward = terza colonna (asse Z locale), proiettato sull'orizzontale
+        float[] fwd_h = new float[3] { T[0, 2], 0f, T[2, 2] };
+        float fwdNorm = getNormV3(fwd_h);
+        if (fwdNorm < 1e-6f)
+        {
+            // forward quasi verticale (degenere): lascia la rotazione, azzera solo la Y
+            float[,] degen = (float[,])T.Clone();
+            degen[1, 3] = 0f;
+            return degen;
+        }
+        fwd_h = productVector3Scalar(fwd_h, 1f / fwdNorm);
+
+        float[] up = new float[3] { 0f, 1f, 0f };
+        float[] rightRaw = CrossProductV3(up, fwd_h);
+        float[] right = productVector3Scalar(rightRaw, 1f / getNormV3(rightRaw));
+
+        float[,] R = composeRByColumnVectors(right, up, fwd_h);
+        return composeT(R, new float[3] { tx, 0f, tz });
+    }
+
     public static float[,] composeT(float[,] R, float[] t)
     {
         float[,] T = new float[4,4];

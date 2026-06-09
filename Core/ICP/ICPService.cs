@@ -38,7 +38,9 @@ public class ICPService
     private Queue<Vector3> icpPathPositions;
     private Vector3 icpEstimatedPos;
 
-    public ICPService(ICPMode icpMode, float deltaHuber, int maxIteration, float maxDistance, float convergenceThreshold, float voxelSize, int nPosesPath, Transform marrtinoLaserLinkTransform, LiDAR3D lidar, GraphSlamService graphSlamService)
+    private bool planarConstraintFlag;
+
+    public ICPService(ICPMode icpMode, float deltaHuber, int maxIteration, float maxDistance, float convergenceThreshold, float voxelSize, int nPosesPath, Transform marrtinoLaserLinkTransform, LiDAR3D lidar, GraphSlamService graphSlamService, bool planarConstraintFlag)
     {
         this.icpMode = icpMode;
         this.deltaHuber = deltaHuber;
@@ -50,6 +52,7 @@ public class ICPService
         this.marrtinoLaserLinkTransform = marrtinoLaserLinkTransform;
         this.lidar3d = lidar;
         this.graphSlamService = graphSlamService;
+        this.planarConstraintFlag = planarConstraintFlag;
 
         TWorldICP = Identity4();
         TRelativeICP = Identity4();
@@ -81,8 +84,22 @@ public class ICPService
         kdSourceTree.BuildTree(sourceLocalTreeListOfPoints, 0);
 
         float[,] deltaT = Solve(TRelativeICP, kdTargetTree, targetLocalTreeListOfPoints, sourceLocalTreeListOfPoints, deltaHuber, maxIteration, maxDistance, convergenceThreshold, icpMode);
-        TRelativeICP = deltaT;
-        TWorldICP = productSquareMatrix4(TWorldICP, TRelativeICP);
+        
+        
+        if (planarConstraintFlag)
+        {
+            float[,] T_candidate = projectPoseToPlane(productSquareMatrix4(TWorldICP, deltaT));
+            deltaT = productSquareMatrix4(InverseT(TWorldICP), T_candidate);   // relativo coerente con la posa planare
+            TWorldICP = T_candidate;
+            TRelativeICP = deltaT;
+        }
+        else
+        {
+            TRelativeICP = deltaT;
+            TWorldICP = productSquareMatrix4(TWorldICP, TRelativeICP);
+        }
+        
+
         // ICP path (cyan): accumula la traslazione stimata
         Vector3 localDelta = new Vector3(TRelativeICP[0, 3], TRelativeICP[1, 3], TRelativeICP[2, 3]);
         Vector3 worldDelta = marrtinoLaserLinkTransform.TransformVector(localDelta);
@@ -129,7 +146,15 @@ public class ICPService
 
     public float[,] SolveInverseICPProblem(float[,] initialGuess, PoseNode candidate, List<Vector3> sourceScannedPoints)
     {
-        return ICPSolver.Solve(initialGuess, candidate.PoseScannedPointsKDTree(), candidate.PoseScannedPoints(), sourceScannedPoints, deltaHuber, maxIteration, maxDistance, convergenceThreshold, icpMode);
+        float[,] deltaTCandidate = ICPSolver.Solve(initialGuess, candidate.PoseScannedPointsKDTree(), candidate.PoseScannedPoints(), sourceScannedPoints, deltaHuber, maxIteration, maxDistance, convergenceThreshold, icpMode);
+        if (planarConstraintFlag)
+        {
+            // La misura di loop closure deve essere planare come l'odometria, altrimenti vincoli
+            // planari e non-planari si scontrano e l'ottimizzatore distorce il grafo (tilt/verticale).
+            // E' una posa relativa tra due nodi planari: stessa proiezione (verticale = [1,3], up = Y).
+            deltaTCandidate = projectPoseToPlane(deltaTCandidate);
+        }
+        return deltaTCandidate;
     }
 
     public void setTWorldICP(float[,] correctedT)
@@ -155,6 +180,14 @@ public class ICPService
         List<Vector3> result = new List<Vector3>();
         foreach (Vector3 v in vectors)
             result.Add(ICPToWorldPosition(v.x, v.y, v.z));
+        return result;
+    }
+
+    public List<(Vector3 from, Vector3 to)> ICPToWorldPositionPairs(List<(Vector3 from, Vector3 to)> pairs)
+    {
+        List<(Vector3, Vector3)> result = new List<(Vector3, Vector3)>();
+        foreach ((Vector3 from, Vector3 to) p in pairs)
+            result.Add((ICPToWorldPosition(p.from.x, p.from.y, p.from.z), ICPToWorldPosition(p.to.x, p.to.y, p.to.z)));
         return result;
     }
 

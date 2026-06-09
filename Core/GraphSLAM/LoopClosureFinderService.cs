@@ -33,37 +33,35 @@ public class LoopClosureFinderService
         return false;
     }
 
-    private List<PoseNode> SearchLoopClosureCandidates_TimeAndConeBased(PoseNode currentNode, List<PoseNode> nodes)
+    // Cono di ricerca in Unity world e in 2D (piano orizzontale X-Z, Y = verticale ignorato).
+    //  - robotPosWorld / robotForwardWorld: posa LIVE del robot (marrtinoLaserLinkTransform),
+    //    così il forward è quello vero di Unity (niente indovinello sull'asse) ed è la direzione
+    //    in cui stai realmente puntando.
+    //  - nodeToWorld: converte la posa (drift-ata) di un nodo in Unity world (ICPToWorldPosition).
+    //  Il test 2D rende la selezione robusta al drift verticale (i nodi rivisitati possono essere
+    //  "scivolati" in alto/basso ma restano allineati sul piano).
+    private List<PoseNode> SearchLoopClosureCandidates_TimeAndConeBased(Vector3 robotPosWorld, Vector3 robotForwardWorld, List<PoseNode> nodes, System.Func<PoseNode, Vector3> nodeToWorld)
     {
         List<PoseNode> returnList = new List<PoseNode>();
-        Vector3 vCurrentNode = currentNode.getPoseTAsV3();
 
-        // Direzione "avanti" del nodo corrente nel frame del grafo: forward = R * asse_forward_locale.
-        // Assumendo che il forward locale del laser sia +Z (convenzione Unity), il forward e' la
-        // TERZA COLONNA della rotazione di PoseT, cioe' (T[0,2], T[1,2], T[2,2]).
-        // ATTENZIONE: se il cono seleziona i nodi DIETRO invece che davanti, il forward locale del
-        //   tuo laser e' un altro asse -> usa +X = colonna 0 (T[*,0]) oppure +Y = colonna 1 (T[*,1]).
-        float[,] T = currentNode.PoseT();
-        Vector3 forward = new Vector3(T[0, 2], T[1, 2], T[2, 2]);
-        if (forward.sqrMagnitude < 1e-12f) return returnList;
-        forward.Normalize();
+        Vector3 fwd = new Vector3(robotForwardWorld.x, 0f, robotForwardWorld.z);
+        if (fwd.sqrMagnitude < 1e-12f) return returnList;
+        fwd.Normalize();
 
         float cosHalfAngle = Mathf.Cos(halfConeAngle * Mathf.Deg2Rad);
 
         foreach (PoseNode node in nodes)
         {
-            Vector3 vNode = node.getPoseTAsV3();
-            Vector3 vDif = vNode - vCurrentNode;
-            float d = vDif.magnitude;
+            Vector3 w = nodeToWorld(node);
+            Vector3 dir = new Vector3(w.x - robotPosWorld.x, 0f, w.z - robotPosWorld.z);   // proiezione 2D
+            float d = dir.magnitude;
 
             // 1) entro il raggio massimo (ed evita il nodo stesso a distanza ~0)
             if (d > maxRadius || d < 1e-6f) continue;
 
             // 2) entro il cono frontale: angolo tra forward e direzione al candidato.
             //    cos(angolo) >= cos(semiangolo)  <=>  angolo <= semiangolo
-            Vector3 dirToCandidate = vDif / d;
-            float cosAngle = Vector3.Dot(forward, dirToCandidate);
-            if (cosAngle >= cosHalfAngle)
+            if (Vector3.Dot(fwd, dir / d) >= cosHalfAngle)
             {
                 returnList.Add(node);
             }
@@ -88,7 +86,7 @@ public class LoopClosureFinderService
         return returnList;
     }
 
-    public List<PoseNode> getLoopClosureCandidates(LoopClosureFinder loopClosureMode, PoseNode currentNode, List<PoseNode> currentNodeKCandidates)
+    public List<PoseNode> getLoopClosureCandidates(LoopClosureFinder loopClosureMode, PoseNode currentNode, List<PoseNode> currentNodeKCandidates, Vector3 robotPosWorld, Vector3 robotForwardWorld, System.Func<PoseNode, Vector3> nodeToWorld)
     {
         List<PoseNode> result = new List<PoseNode>();
         if (loopClosureMode == LoopClosureFinder.KNodeGapBased)
@@ -97,7 +95,7 @@ public class LoopClosureFinderService
         }
         else
         {
-            result = SearchLoopClosureCandidates_TimeAndConeBased(currentNode, currentNodeKCandidates);
+            result = SearchLoopClosureCandidates_TimeAndConeBased(robotPosWorld, robotForwardWorld, currentNodeKCandidates, nodeToWorld);
         }
         return result;
     }

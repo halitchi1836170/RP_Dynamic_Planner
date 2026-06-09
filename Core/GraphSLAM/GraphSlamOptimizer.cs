@@ -11,16 +11,18 @@ public class GraphSlamOptimizer
     private int maxCGIterations;
     private float convergenceThreshold;
     private float convergenceCGThreshold;
+    private float huberDeltaGraphSlamOptimization;
 
     private PoseGraph poseGraph;
 
-    public GraphSlamOptimizer(int MaxIterations, int MaxCGIterations, float convergenceGraphSlamOptimizerThreshold, float convergenceCGAlgorithm, PoseGraph PoseGraph)
+    public GraphSlamOptimizer(int MaxIterations, int MaxCGIterations, float convergenceGraphSlamOptimizerThreshold, float convergenceCGAlgorithm, PoseGraph PoseGraph, float huberDeltaGraphSlamOptimization)
     {
         this.maxIterations = MaxIterations;
         this.maxCGIterations = MaxCGIterations;
         this.poseGraph = PoseGraph;
         this.convergenceThreshold = convergenceGraphSlamOptimizerThreshold;
         this.convergenceCGThreshold = convergenceCGAlgorithm;
+        this.huberDeltaGraphSlamOptimization = huberDeltaGraphSlamOptimization;
     }
 
     private class GraphMatrixBlock6x6{
@@ -95,6 +97,17 @@ public class GraphSlamOptimizer
 
                 float[] e_ij = LogMap(productSquareMatrix4(productSquareMatrix4(InverseT(z_ij), InverseT(T_i)), T_j));
 
+                float chi = getNorm(e_ij);
+                float wHuber = huberDeltaGraphSlamOptimization / chi;
+                if (chi <= huberDeltaGraphSlamOptimization)
+                {
+                    wHuber = 1.0f;
+                }
+
+                float w = edge.IsLoopClosure() ? wHuber : 1.0f;
+
+                float[,] Omega_ij_eff = productSquareMatrix6Scalar(Omega_ij, w);
+
                 // Jacobiani analitici SE(3) (perturbazione destra X <- X * Exp(delta)):
                 //   J_j =  J_r^-1(e)               ~= I + 1/2 ad_e
                 //   J_i = -J_l^-1(e) * Adj(Z^-1)   ~= -(I - 1/2 ad_e) * Adj(InverseT(z))
@@ -112,8 +125,8 @@ public class GraphSlamOptimizer
                 float[,] Jj_T = transposeSquareMatrix6(J_j);
 
                 // Pre-moltiplicazioni J^T * Omega (con Omega = I risultano J^T, ma teniamo il caso generale)
-                float[,] JiT_O = productSquareMatrix6(Ji_T, Omega_ij);
-                float[,] JjT_O = productSquareMatrix6(Jj_T, Omega_ij);
+                float[,] JiT_O = productSquareMatrix6(Ji_T, Omega_ij_eff);
+                float[,] JjT_O = productSquareMatrix6(Jj_T, Omega_ij_eff);
 
                 // Blocchi di H = J^T Omega J
                 hBlocksMap[GetBlockID(i, i, NNodes)].AddValues(productSquareMatrix6(JiT_O, J_i));
@@ -161,7 +174,7 @@ public class GraphSlamOptimizer
             dx = SolveGenericLinearSystemUsingCG(hBlocksList, b, totalSize, maxCGIterations, convergenceCGThreshold);
 
             float dxNorm = getNorm(dx);
-            Debug.Log($"GraphSLAM optimizer iter {iter}: dx norm = {dxNorm:F6}");
+            //Debug.Log($"GraphSLAM optimizer iter {iter}: dx norm = {dxNorm:F6}");
             if (dxNorm < convergenceThreshold) break;
 
             foreach (PoseNode node in poseGraph.Nodes())
