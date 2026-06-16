@@ -33,6 +33,7 @@ public class Orchestrator : MonoBehaviour
     public string loopClosureCircleTopic = "/graph_slam/loop_closure_radius";
     public string loopClosureEdgesTopic = "/graph_slam/loop_closure_edges";
     public string coneFanTopic = "/graph_slam/cone_fan";
+    public string occupancyRosTopic = "/occupancy_grid";
 
     public string GRASLAMFIELDS = "FOLLOWING GRAPH SLAM FIELDS";
     public float minDeltaTranslation = 0.1f;
@@ -49,14 +50,23 @@ public class Orchestrator : MonoBehaviour
     public float halfConeAngleLoopClosureFinder = 30.0f;
     public int secondsFrequencyLoopClosureFinder = 15;
     public bool planarConstraintFlag = true;
-    private float huberDeltaGraphSlamOptimization = 0.5f;
+    public float huberDeltaGraphSlamOptimization = 0.5f;
 
-    public string ODOMETRYFILEDS = "FOLLOWING ODOMETRY FILEDS";
+    public string ODOMETRYFILEDS = "FOLLOWING ODOMETRY FIELDS";
     public float angularVelocityThreshold = 0.001f;
     public float wheelVelocityThreshold = 0.05f;
     public float odometryFrequency = 55.0f; //Hz
     public bool publishLastNOdometryPoses = true;
     public int NOdometryLastPoses = 250;
+
+    public string OCCUPANCYGRIDFIELDS = "FOOLLOWING OCCUPANCY GRID FIELDS";
+    public float resolution = 0.02f;
+    public float zMin = 0.2f;
+    public float zMax = 1.0f;
+    public float probOcc = 0.75f;  // Se rileva un ostacolo, mi fido al 75%
+    public float probFree = 0.35f; // Se non rileva nulla, la probabilità che ci sia un ostacolo scende al 35%
+    public float occBlockThreshold = 1.8f;
+    public float elevThrehsold = 6;
 
     //--------------------------------------------------------------------------------------------------------------------------------------------------------
     //                                                                    HARDWARE FIELDS
@@ -78,7 +88,7 @@ public class Orchestrator : MonoBehaviour
     private PublishingService publisherService;
     private OdometryService odometryService;
     private LoopClosureFinderService loopClosureFinderService;
-
+    private OccupancyGridService occupancyGridService;
 
 
 
@@ -117,7 +127,7 @@ public class Orchestrator : MonoBehaviour
         publisherService = new PublishingService();
         odometryService = new OdometryService(angularVelocityThreshold, wheelVelocityThreshold, odometryFrequency, articulationBodiesRefs, publishLastNOdometryPoses, NOdometryLastPoses);
         loopClosureFinderService = new LoopClosureFinderService(halfConeAngleLoopClosureFinder, k_midDeltaIDBetweenCandidates, secondsFrequencyLoopClosureFinder, maxRadiusLoopClosureFinder, thresholdLoopClosure);
-
+        occupancyGridService = new OccupancyGridService(resolution, zMin, zMax, probOcc, probFree, occBlockThreshold, elevThrehsold);
 
         //------------------REGISTRAZIONE EVENTI
         lidar.OnScanComplete += ScanCompletedLetsWork;
@@ -139,6 +149,7 @@ public class Orchestrator : MonoBehaviour
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(loopClosureCircleTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(loopClosureEdgesTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(coneFanTopic);
+        ROSConnection.GetOrCreateInstance().RegisterPublisher<OccupancyGridMsg>(occupancyRosTopic);
     }
 
     // Update is called once per frame
@@ -158,7 +169,7 @@ public class Orchestrator : MonoBehaviour
                 publisherService.PublishOdometryPath(odometryService.getUpdatedLastOdometryPoses(), odometryPathRosTopic);
             }
 
-
+            //Debug.Log($"occupancy cells = {occupancyGridService.getOccupancyGridMap().Count}");
 
         }
 
@@ -193,6 +204,9 @@ public class Orchestrator : MonoBehaviour
 
         if (hasMoovedSinceLastNode)
         {
+            occupancyGridService.updateGridMap(TWorldICP, sourceLocalTreeListOfPoints, v => icpService.ICPToWorldPosition(v.x, v.y, v.z));
+            occupancyGridService.updateDataForPublisher();
+
             graphSlamService.updateGraphSLAMWithNewNode(TWorldICP, sourceLocalTreeListOfPoints, kdSourceTree);
             //Debug.Log("Inserted new node in the Graph SLAM");
             publisherService.PublishGraphNodes( icpService.ICPToWorldPositionEnumerableNodes(graphSlamService.getGraphNodes()), graphSlamNodesTopic);
@@ -220,6 +234,8 @@ public class Orchestrator : MonoBehaviour
         publisherService.PublishICPPath(updatedWorld.icpWorldPositions, icpPathRosTopic);
 
         publisherService.PublishICPMap(updatedWorld.transformedWorldPointsList, icpMapRosTopic);
+
+        publisherService.PublishOccupancyGridMap(occupancyGridService.getDataForPublisher(), occupancyRosTopic);
 
     }
 
@@ -275,7 +291,17 @@ public class Orchestrator : MonoBehaviour
             // l'accumulatore è Identity, quindi si riduce a getNewNode().PoseT().
             icpService.setTWorldICP(productSquareMatrix4(graphSlamService.getNewNode().PoseT(), graphSlamService.getAccumulatedRelativeSinceLastNode()));
             publisherService.PublishGraphNodes(icpService.ICPToWorldPositionEnumerableNodes(graphSlamService.getGraphNodes()), graphSlamNodesTopic);
+            
             graphSlamService.updateGlobalScannedPointsAfterOptimization();
+
+            Debug.Log($"Updating occupancy grid map after optimization...");
+            occupancyGridService.clear();
+            foreach (PoseNode node in graphSlamService.getGraphNodes())
+            {
+                occupancyGridService.updateGridMap(node.PoseT(), node.PoseScannedPoints(), v => icpService.ICPToWorldPosition(v.x, v.y, v.z));
+            }
+            occupancyGridService.updateDataForPublisher();
+
             publisherService.PublishUpdatedGlobalPointCloudMap( icpService.ICPToWorldPositionListVectors(graphSlamService.getUpdatedGlobalMapPointCloud()) , graphSlamGlobalpointCloudTopic);
             publisherService.PublishLoopClosureEdges(icpService.ICPToWorldPositionPairs(graphSlamService.getClosureEdgeVector3Couples()), loopClosureEdgesTopic);
         }
