@@ -4,8 +4,10 @@ using UnityEngine;
 
 public class OdometryService
 {
-    private float odometryFrequency; 
+    private float odometryFrequency;
     private float lastTimeOdometry = 0.0f;
+
+    private float wheelVelocityThreshold;
 
     private ArticulationBodyRefs articulationBodyRefs;
     private ArticulationBody leftWheel;
@@ -23,6 +25,7 @@ public class OdometryService
     {
         this.odometryFrequency = odometryFrequency;
         this.articulationBodyRefs = articulationBodiesRefs;
+        this.wheelVelocityThreshold = wheelVelocityThreshold;
 
         (ArticulationBody, ArticulationBody) wheels = articulationBodyRefs.getWheelArticulationBodyReference();
         leftWheel = wheels.Item1;
@@ -49,6 +52,15 @@ public class OdometryService
     private (float, float) GetWheelJointVelocities()
     {
         return (leftWheel.jointVelocity[0], rightWheel.jointVelocity[0]);
+    }
+
+    // Il robot si sta muovendo davvero (traslazione o rotazione) se almeno una ruota gira sopra soglia.
+    // Serve a NON creare nodi/aggiornare la griglia quando il robot è fermo: così il drift dell'ICP
+    // da fermo non genera nodi spuri (e quindi muri "fantasma" paralleli nella occupancy grid).
+    public bool isRobotMoving()
+    {
+        (float wL, float wR) = GetWheelJointVelocities();
+        return Mathf.Abs(wL) > wheelVelocityThreshold || Mathf.Abs(wR) > wheelVelocityThreshold;
     }
 
     public void letsLocalizeUsingOdometry()

@@ -177,7 +177,7 @@ public class OccupancyGridService
             int cx = couple.Key.Item1;
             int cy = couple.Key.Item2;
             int idx = (cy - mapExtremas.mapMinY) * W + (cx - mapExtremas.mapMinX);
-            float p = (float)(1.0 / (1 + Mathf.Pow((float) Math.E, (-1 * couple.Value))));
+            float p =  (float)(1.0 / (1 + Mathf.Pow((float) Math.E, (-1 * couple.Value))));
             dataForPub[idx] = (sbyte)Mathf.Floor(100 * p);
         }
         dataForPublisher = (dataForPub, W, H, originX, originY, resolution);

@@ -525,4 +525,31 @@ public class PublishingService
 
         ROSConnection.GetOrCreateInstance().Publish(occupancyRosTopic, msg);
     }
+
+
+    internal void PublishDistanceMap((sbyte[] data, int width, int height, float originX, float originY, float resolution) dataReturned, string distanceMapRosTopic)
+    {
+        //Debug.Log($"OCC received: len={dataReturned.data.Length} W={dataReturned.width} H={dataReturned.height}");
+
+        if (dataReturned.data is null || dataReturned.data.Length == 0 || dataReturned.width <= 0 || dataReturned.height <= 0) return;
+
+        OccupancyGridMsg msg = new OccupancyGridMsg();
+        msg.header = getPointCloud2MsgHeader();   // frame_id "odom", stesso degli altri topic
+
+        msg.info = new MapMetaDataMsg();
+        msg.info.resolution = dataReturned.resolution;
+        msg.info.width = (uint)dataReturned.width;
+        msg.info.height = (uint)dataReturned.height;
+        msg.info.origin = new PoseMsg
+        {
+            position = new PointMsg(dataReturned.originX, dataReturned.originY, 0.0),       // angolo in basso-sinistra (metri)
+            orientation = new QuaternionMsg(0, 0, 0, 1)            // nessuna rotazione della griglia
+        };
+
+        msg.data = dataReturned.data;   // row-major, valori 0..100 e -1 = sconosciuto
+
+        ROSConnection.GetOrCreateInstance().Publish(distanceMapRosTopic, msg);
+    }
+
+
 }
