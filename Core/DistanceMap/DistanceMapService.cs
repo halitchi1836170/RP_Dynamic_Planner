@@ -1,4 +1,3 @@
-using Assimp;
 using System;
 using System.Collections.Generic;
 using UnityEngine;
@@ -14,12 +13,16 @@ public class DistanceMapService
     private float[] distanceCalculatedMap;
 
     private float obstacleThreshold;
+    private float k;
+    private float eps;
 
     private float maxDistanceCalculatedInMap;
 
-    public DistanceMapService(float obsThreshold)
+    public DistanceMapService(float obsThreshold, float k, float eps)
     {
         this.obstacleThreshold = obsThreshold;
+        this.k = k;
+        this.eps = eps;
     }
 
     public void SetOccupancyGridMap((sbyte[] map, int W, int H, float originX, float originY, float resolution) givenOccupancyGridMapSet)
@@ -102,6 +105,11 @@ public class DistanceMapService
     {
         return distanceCalculatedMap;
     }
+
+    public DistanceMap getDistanceMapInstance()
+    {
+        return new DistanceMap(distanceCalculatedMap, W, H, originX, originY, resolution, k, eps);
+    }
     
     public (sbyte[] data, int width, int height, float originX, float originY, float resolution) getDistanceMapForPublisher()
     {
@@ -128,6 +136,156 @@ public class DistanceMapService
             }
         }
         return (returnedData, W, H, originX, originY, resolution);
+    }
+
+}
+
+
+public class DistanceMap
+
+{
+
+    private float[] distanceMap;
+    private int W;
+    private int H;
+    private float originX;
+    private float originY;
+    private float resolution;
+
+    private float k;
+    private float eps;
+
+    public DistanceMap(float[] distanceMap, int w, int h, float originX, float originY, float resolution, float k, float eps)
+    {
+        this.distanceMap = distanceMap;
+        this.W = w;
+        this.H = h;
+        this.originX = originX; 
+        this.originY = originY;
+        this.resolution = resolution;
+        this.k = k;
+        this.eps = eps;
+    }
+
+    public int getW ()
+    {
+        return W;
+    }
+
+    public int getH()
+    {
+        return H;
+    }
+
+    public float[] getDistanceMap()
+    {
+        return distanceMap;
+    }
+
+    public float getK()
+    {
+        return k;
+    }
+
+    public float getEps()
+    {
+        return eps;
+    }
+
+    public int getIndexFromWorldPosition((float X, float Y) pos)
+    {
+        (int cellX, int cellY) cell = getCellFromWorldPosition(pos);
+        return getIndexFromCell((cell.cellX, cell.cellY));
+    }
+
+    public (int cx, int cy) getCellFromWorldPosition((float X, float Y) pos)
+    {
+        int cellX = (int)Mathf.Floor((pos.X-originX) / resolution);
+        int cellY = (int)Mathf.Floor((pos.Y-originY) / resolution);
+        return (cellX, cellY);
+    }
+
+    public int getIndexFromCell((int cellX, int cellY) cell)
+    {
+        return cell.cellY * W + cell.cellX;
+    }
+
+    public (int x, int y) getCellFromIndex(int index)
+    {
+        return ((int)index % W, (int) index/W);
+    }
+
+    public List<((int cx, int cy),float dist)> getNeighborsOfWordPosition(int uIndex)
+    {
+        (int cellX, int cellY) cellPos = getCellFromIndex(uIndex);
+        List<((int, int),float)> returnNeighbors = new List<((int, int), float)>();
+
+        float root2 = 1.4142f;
+        float d1 = 1f;
+
+        (int, int) uCell = (cellPos.cellX - 1, cellPos.cellY - 1);
+        if (cellInMap(uCell)) returnNeighbors.Add((uCell, root2));
+        uCell = (cellPos.cellX, cellPos.cellY - 1);
+        if (cellInMap(uCell)) returnNeighbors.Add((uCell,d1));
+        uCell = (cellPos.cellX + 1, cellPos.cellY - 1);
+        if (cellInMap(uCell)) returnNeighbors.Add((uCell,root2));
+
+        uCell = (cellPos.cellX - 1, cellPos.cellY);
+        if (cellInMap(uCell)) returnNeighbors.Add((uCell,d1));
+        uCell = (cellPos.cellX + 1, cellPos.cellY);
+        if (cellInMap(uCell)) returnNeighbors.Add((uCell,d1));
+
+        uCell = (cellPos.cellX - 1, cellPos.cellY + 1);
+        if (cellInMap(uCell)) returnNeighbors.Add((uCell,root2));
+        uCell = (cellPos.cellX, cellPos.cellY + 1);
+        if (cellInMap(uCell)) returnNeighbors.Add((uCell,d1));
+        uCell = (cellPos.cellX + 1, cellPos.cellY + 1);
+        if (cellInMap(uCell)) returnNeighbors.Add((uCell,root2));
+
+        return returnNeighbors;
+    }
+
+    private bool cellInMap((int cellX, int cellY) cell)
+    {
+        if (cell.cellX >= 0 && cell.cellX < W && cell.cellY >= 0 && cell.cellY < H) return true;
+        return false;
+    }
+
+    public float getHeuristicDistanceFromGoal( int startIndex, int goalIndex)
+    {
+        (int startX, int startY) start = getCellFromIndex(startIndex);
+        (int goalX, int goalY) goal = getCellFromIndex(goalIndex);
+
+        float squareDistance = Mathf.Sqrt(Mathf.Pow(goal.goalX - start.startX, 2) + Mathf.Pow(goal.goalY - start.startY, 2));
+        return squareDistance;
+    }
+
+
+    public (List<int>, List<(float, float)>) ReconstructPath(int[] parentMap, int goalIndex, int startIndex)
+    {
+        List<int> path = new List<int>();
+        List<(float x, float y)> pathWorld = new List<(float x, float y)>();
+
+        int current_index = goalIndex;
+        while (current_index != -1)
+        {
+            int row = (int)current_index / W;
+            int col = (int)current_index % W;
+            float worldX = (float) (originX + (col + 0.5) * resolution);
+            float worldY = (float) (originY + (row + 0.5) * resolution);
+
+            path.Add(current_index);
+            pathWorld.Add((worldX, worldY));
+
+            if (current_index == startIndex) break;
+
+            current_index = parentMap[current_index];
+        }
+
+        path.Reverse(); // Il percorso ora va da Start a Goal
+        pathWorld.Reverse();
+
+        return (path, pathWorld);
     }
 
 }

@@ -98,6 +98,11 @@ public class OdometryService
         return this.currentConfiguration;
     }
 
+    public (float x, float z) getPlanarUpdatedConfiguration()
+    {
+        return (this.currentConfiguration.Item1, this.currentConfiguration.Item3);
+    }
+
     public Queue<Vector3>  getUpdatedLastOdometryPoses()
     {
         return this.lastNOdometryPoses;

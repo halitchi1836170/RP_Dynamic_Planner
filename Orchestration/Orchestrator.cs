@@ -7,6 +7,7 @@ using Unity.Robotics.ROSTCPConnector;
 using UnityEngine;
 using static MatrixVectorUtilities;
 using static PoseMatrix4x4;
+using static UnicycleModelUtilities;
 
 public class Orchestrator : MonoBehaviour
 {
@@ -35,6 +36,9 @@ public class Orchestrator : MonoBehaviour
     public string coneFanTopic = "/graph_slam/cone_fan";
     public string occupancyRosTopic = "/occupancy_grid";
     public string distanceMapRosTopic = "/distanceMap";
+    public string plannedTrajectoryRosTopic = "/planned_path";
+    public string startDebugRosTopic = "/debug/start_pose";
+    public string goalDebugRosTopic = "/debug/goal_pose";
 
     public string GRASLAMFIELDS = "FOLLOWING GRAPH SLAM FIELDS";
     public float minDeltaTranslation = 0.1f;
@@ -77,6 +81,21 @@ public class Orchestrator : MonoBehaviour
     private bool distanceMapComputed = false;
     private float lastDistanceMapPublish = 0f;
 
+    public string MOTIONPLANNINGFILED = "FOLLOWING MOTION PLANNING FIELDS";
+    public bool goalSettedLetsPlan = true;
+    public bool controlTrajectory = false;
+    public float goalXUnity = -4f;
+    public float goalZUnity = 1.5f;
+    public Planner plannerMode = Planner.A;
+    public float k = 50f;
+    public float eps = 0.01f;
+    private bool trajectoryPlanned = false;
+    private float lastTrajectoryPublish = 0f;
+    public float plannedTrajectoryRepublishPeriod = 1.0f;
+    private (float x, float y) startDebugPoint;
+    private (float x, float y) goalDebugPoint;
+
+
     //--------------------------------------------------------------------------------------------------------------------------------------------------------
     //                                                                    HARDWARE FIELDS
     //--------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -100,6 +119,8 @@ public class Orchestrator : MonoBehaviour
     private OccupancyGridService occupancyGridService;
     private IOFileOperationService ioService;
     private DistanceMapService distanceMapService;
+    private MotionPlannerService motionPlannerService;
+    private ControllerService controllerService;
 
     //--------------------------------------------------------------------------------------------------------------------------------------------------------
     //                                                                       ROBOT STATE
@@ -138,9 +159,9 @@ public class Orchestrator : MonoBehaviour
         loopClosureFinderService = new LoopClosureFinderService(halfConeAngleLoopClosureFinder, k_midDeltaIDBetweenCandidates, secondsFrequencyLoopClosureFinder, maxRadiusLoopClosureFinder, thresholdLoopClosure);
         occupancyGridService = new OccupancyGridService(resolution, zMin, zMax, probOcc, probFree, occBlockThreshold, elevThrehsold);
         ioService = new IOFileOperationService(occupancyGridMapFileName);
-        distanceMapService = new DistanceMapService(obstacleThreshold);
-
-
+        distanceMapService = new DistanceMapService(obstacleThreshold, k, eps);
+        motionPlannerService = new MotionPlannerService();
+        controllerService = new ControllerService();
 
         //------------------REGISTRAZIONE EVENTI
         lidar.OnScanComplete += ScanCompletedLetsWork;
@@ -161,6 +182,9 @@ public class Orchestrator : MonoBehaviour
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(coneFanTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<OccupancyGridMsg>(occupancyRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<OccupancyGridMsg>(distanceMapRosTopic);
+        ROSConnection.GetOrCreateInstance().RegisterPublisher<PathMsg>(plannedTrajectoryRosTopic);
+        ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(startDebugRosTopic);
+        ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(goalDebugRosTopic);
 
         //------------------ONE TIME ACTIONS
         if (calculateAndOverrideOccupancyMapFlag == false)
@@ -169,6 +193,22 @@ public class Orchestrator : MonoBehaviour
             distanceMapService.calculateDistanceMap();
             publisherService.PublishDistanceMap(distanceMapService.getDistanceMapForPublisher(), distanceMapRosTopic);
             distanceMapComputed = true;
+
+            if (goalSettedLetsPlan)
+            {
+                (float sx, float sy, float sz) start = UnityToRosPosition(marrtionLaserLinkTransform.position.x, marrtionLaserLinkTransform.position.y, marrtionLaserLinkTransform.position.z);
+                (float gx, float gy, float gz) goal = UnityToRosPosition(goalXUnity, 0, goalZUnity);
+                startDebugPoint = (start.sx, start.sy);
+                goalDebugPoint = (goal.gx, goal.gy);
+                motionPlannerService.DetermineTrajectory(distanceMapService.getDistanceMapInstance(), startDebugPoint, goalDebugPoint, plannerMode);
+                trajectoryPlanned = motionPlannerService.TrajectoryDetermined();
+            }
+
+            if(motionPlannerService.TrajectoryDetermined() && controlTrajectory)
+            {
+                controllerService.FollowTrajectory();
+            }
+
         }
     }
 
@@ -179,6 +219,14 @@ public class Orchestrator : MonoBehaviour
         {
             publisherService.PublishDistanceMap(distanceMapService.getDistanceMapForPublisher(), distanceMapRosTopic);
             lastDistanceMapPublish = Time.time;
+        }
+
+        if(trajectoryPlanned && Time.time - lastTrajectoryPublish > plannedTrajectoryRepublishPeriod)
+        {
+            publisherService.PublishPlannedTrajectory(motionPlannerService.getTrajectoryWorld(), plannedTrajectoryRosTopic);
+            publisherService.PublishDebugPoint(startDebugPoint, startDebugRosTopic);
+            publisherService.PublishDebugPoint(goalDebugPoint, goalDebugRosTopic);
+            lastTrajectoryPublish = Time.time;
         }
 
         if (odometryService.isTimeToLocalize())

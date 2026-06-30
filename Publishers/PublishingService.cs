@@ -551,5 +551,62 @@ public class PublishingService
         ROSConnection.GetOrCreateInstance().Publish(distanceMapRosTopic, msg);
     }
 
+    // Traiettoria pianificata come nav_msgs/Path. I punti arrivano GIA' in coordinate ROS
+    // (frame della griglia, X-Y di "odom"): originX/originY + (col/row)*resolution -> NIENTE UnityToRos.
+    public void PublishPlannedTrajectory(List<(float x, float y)> pathWorld, string topic)
+    {
+        if (pathWorld == null) return;
+
+        PathMsg pathMsg = new PathMsg();
+        HeaderMsg header = getPointCloud2MsgHeader();   // frame_id "odom", stesso di occupancy/distance map
+        pathMsg.header = header;
+
+        List<PoseStampedMsg> poses = new List<PoseStampedMsg>(pathWorld.Count);
+        foreach ((float x, float y) p in pathWorld)
+        {
+            PoseStampedMsg ps = new PoseStampedMsg();
+            ps.header = header;
+            ps.pose = new PoseMsg
+            {
+                position = new PointMsg(p.x, p.y, 0.0),       // già ROS, nessuna conversione
+                orientation = new QuaternionMsg(0, 0, 0, 1)
+            };
+            poses.Add(ps);
+        }
+        pathMsg.poses = poses.ToArray();
+
+        ROSConnection.GetOrCreateInstance().Publish(topic, pathMsg);
+    }
+
+    // Pubblica un singolo punto (debug) come PointCloud2. Il punto è GIA' in coordinate ROS
+    // (frame griglia, X-Y di "odom") -> nessuna conversione. Riusabile per start, goal, ecc.
+    // In RViz: display PointCloud2 con Size grande (es. 0.15) per vederlo.
+    public void PublishDebugPoint((float x, float y) rosPoint, string topic)
+    {
+        uint pointStep = 12;
+        uint width = 1;
+        byte[] data = new byte[pointStep * width];
+        Array.Copy(BitConverter.GetBytes(rosPoint.x), 0, data, 0, 4);
+        Array.Copy(BitConverter.GetBytes(rosPoint.y), 0, data, 4, 4);
+        Array.Copy(BitConverter.GetBytes(0.0f), 0, data, 8, 4);
+
+        PointCloud2Msg msg = new PointCloud2Msg();
+        msg.header = getPointCloud2MsgHeader();   // frame_id "odom", stesso di griglia/path
+        msg.height = 1;
+        msg.width = width;
+        msg.fields = new PointFieldMsg[]
+        {
+            new PointFieldMsg("x", 0, PointFieldMsg.FLOAT32, 1),
+            new PointFieldMsg("y", 4, PointFieldMsg.FLOAT32, 1),
+            new PointFieldMsg("z", 8, PointFieldMsg.FLOAT32, 1),
+        };
+        msg.is_bigendian = false;
+        msg.point_step = pointStep;
+        msg.row_step = pointStep * width;
+        msg.data = data;
+        msg.is_dense = true;
+
+        ROSConnection.GetOrCreateInstance().Publish(topic, msg);
+    }
 
 }
