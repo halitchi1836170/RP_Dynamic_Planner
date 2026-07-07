@@ -192,6 +192,11 @@ public class DistanceMap
         return eps;
     }
 
+    public float getResolution()
+    {
+        return resolution;
+    }
+
     public int getIndexFromWorldPosition((float X, float Y) pos)
     {
         (int cellX, int cellY) cell = getCellFromWorldPosition(pos);

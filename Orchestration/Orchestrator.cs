@@ -37,6 +37,7 @@ public class Orchestrator : MonoBehaviour
     public string occupancyRosTopic = "/occupancy_grid";
     public string distanceMapRosTopic = "/distanceMap";
     public string plannedTrajectoryRosTopic = "/planned_path";
+    public string smoothedTrajectoryRosTopic = "/smoothed_path";
     public string startDebugRosTopic = "/debug/start_pose";
     public string goalDebugRosTopic = "/debug/goal_pose";
 
@@ -94,6 +95,8 @@ public class Orchestrator : MonoBehaviour
     public float plannedTrajectoryRepublishPeriod = 1.0f;
     private (float x, float y) startDebugPoint;
     private (float x, float y) goalDebugPoint;
+    public bool smoothTrajWithLoSPS = true;
+    public float epsilonTunnelLoSPS = 0.25f; // Dall'URDF: box base 0.28x0.37 m -> raggio circoscritto ~0.23 m; 0.25 m aggiunge un piccolo margine.
 
 
     //--------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -160,7 +163,7 @@ public class Orchestrator : MonoBehaviour
         occupancyGridService = new OccupancyGridService(resolution, zMin, zMax, probOcc, probFree, occBlockThreshold, elevThrehsold);
         ioService = new IOFileOperationService(occupancyGridMapFileName);
         distanceMapService = new DistanceMapService(obstacleThreshold, k, eps);
-        motionPlannerService = new MotionPlannerService();
+        motionPlannerService = new MotionPlannerService(smoothTrajWithLoSPS, epsilonTunnelLoSPS);
         controllerService = new ControllerService();
 
         //------------------REGISTRAZIONE EVENTI
@@ -183,6 +186,7 @@ public class Orchestrator : MonoBehaviour
         ROSConnection.GetOrCreateInstance().RegisterPublisher<OccupancyGridMsg>(occupancyRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<OccupancyGridMsg>(distanceMapRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PathMsg>(plannedTrajectoryRosTopic);
+        ROSConnection.GetOrCreateInstance().RegisterPublisher<PathMsg>(smoothedTrajectoryRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(startDebugRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(goalDebugRosTopic);
 
@@ -224,6 +228,7 @@ public class Orchestrator : MonoBehaviour
         if(trajectoryPlanned && Time.time - lastTrajectoryPublish > plannedTrajectoryRepublishPeriod)
         {
             publisherService.PublishPlannedTrajectory(motionPlannerService.getTrajectoryWorld(), plannedTrajectoryRosTopic);
+            if (smoothTrajWithLoSPS) publisherService.PublishPlannedTrajectory(motionPlannerService.getSmoothTrajectoryWorld(), smoothedTrajectoryRosTopic);
             publisherService.PublishDebugPoint(startDebugPoint, startDebugRosTopic);
             publisherService.PublishDebugPoint(goalDebugPoint, goalDebugRosTopic);
             lastTrajectoryPublish = Time.time;
