@@ -97,6 +97,9 @@ public class Orchestrator : MonoBehaviour
     private (float x, float y) goalDebugPoint;
     public bool smoothTrajWithLoSPS = true;
     public float epsilonTunnelLoSPS = 0.25f; // Dall'URDF: box base 0.28x0.37 m -> raggio circoscritto ~0.23 m; 0.25 m aggiunge un piccolo margine.
+    public float linearMeanVelocity = 15.0f;
+    public (double vel_qi, double acc_qi) qiCouple = (0.0, 0.0);
+    public (double vel_qf, double acc_qf) qfCouple = (0.0, 0.0);
 
 
     //--------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -163,7 +166,7 @@ public class Orchestrator : MonoBehaviour
         occupancyGridService = new OccupancyGridService(resolution, zMin, zMax, probOcc, probFree, occBlockThreshold, elevThrehsold);
         ioService = new IOFileOperationService(occupancyGridMapFileName);
         distanceMapService = new DistanceMapService(obstacleThreshold, k, eps);
-        motionPlannerService = new MotionPlannerService(smoothTrajWithLoSPS, epsilonTunnelLoSPS);
+        motionPlannerService = new MotionPlannerService(smoothTrajWithLoSPS, epsilonTunnelLoSPS, linearMeanVelocity, qiCouple, qfCouple);
         controllerService = new ControllerService();
 
         //------------------REGISTRAZIONE EVENTI
@@ -204,11 +207,12 @@ public class Orchestrator : MonoBehaviour
                 (float gx, float gy, float gz) goal = UnityToRosPosition(goalXUnity, 0, goalZUnity);
                 startDebugPoint = (start.sx, start.sy);
                 goalDebugPoint = (goal.gx, goal.gy);
-                motionPlannerService.DetermineTrajectory(distanceMapService.getDistanceMapInstance(), startDebugPoint, goalDebugPoint, plannerMode);
-                trajectoryPlanned = motionPlannerService.TrajectoryDetermined();
+                motionPlannerService.DetermineGeometricTrajectory(distanceMapService.getDistanceMapInstance(), startDebugPoint, goalDebugPoint, plannerMode);
+                trajectoryPlanned = motionPlannerService.GeometricTrajectoryDetermined();
+                motionPlannerService.LetsSplineGeometricTrajectory();
             }
 
-            if(motionPlannerService.TrajectoryDetermined() && controlTrajectory)
+            if(motionPlannerService.GeometricTrajectoryDetermined() && controlTrajectory)
             {
                 controllerService.FollowTrajectory();
             }
@@ -227,8 +231,8 @@ public class Orchestrator : MonoBehaviour
 
         if(trajectoryPlanned && Time.time - lastTrajectoryPublish > plannedTrajectoryRepublishPeriod)
         {
-            publisherService.PublishPlannedTrajectory(motionPlannerService.getTrajectoryWorld(), plannedTrajectoryRosTopic);
-            if (smoothTrajWithLoSPS) publisherService.PublishPlannedTrajectory(motionPlannerService.getSmoothTrajectoryWorld(), smoothedTrajectoryRosTopic);
+            publisherService.PublishPlannedTrajectory(motionPlannerService.getGeometricTrajectoryWorld(), plannedTrajectoryRosTopic);
+            if (smoothTrajWithLoSPS) publisherService.PublishPlannedTrajectory(motionPlannerService.getGeometricSmoothTrajectoryWorld(), smoothedTrajectoryRosTopic);
             publisherService.PublishDebugPoint(startDebugPoint, startDebugRosTopic);
             publisherService.PublishDebugPoint(goalDebugPoint, goalDebugRosTopic);
             lastTrajectoryPublish = Time.time;

@@ -1,7 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using Unity.VisualScripting;
 using UnityEngine;
+using static MatrixVectorUtilities;
+using static TridiagonalSolver;
 
 public enum Planner { A, Dijkstra }
 
@@ -10,35 +13,41 @@ public class MotionPlannerService
     private bool smoothTrajWithLoSPS;
     private float epsilon;
     private DistanceMap distanceMap;
-    private List<int> trajectoryToBeFollowed;
-    private List<(float, float)> trajectoryToBeFollowedWorld;
-    private List<(float, float)> smoothTrajectoryToBeFollowedWorld;
-    private bool trajectoryDetermined;
+    private List<int> geometricIndexesTrajectoryToBeFollowed;
+    private List<(float, float)> geometricTrajectoryToBeFollowedWorld;
+    private List<(float, float)> smoothGeometricTrajectoryToBeFollowedWorld;
+    private bool geometricTrajectoryDetermined;
+    private float linearMeanVelocity;
+    private (double vel_qi, double acc_qi) qiCouple;
+    private (double vel_qf, double acc_qf) qfCouple;
 
-    public MotionPlannerService(bool smoothTrajWithLoSPS, float epsilon)
+    public MotionPlannerService(bool smoothTrajWithLoSPS, float epsilon, float linearMeanVelocity, (double vel_qi, double acc_qi) qiCouple, (double vel_qf, double acc_qf) qfCouple)
     {
-        trajectoryToBeFollowed = new List<int>();
-        trajectoryToBeFollowedWorld = new List<(float, float)>();
-        smoothTrajectoryToBeFollowedWorld = new List<(float, float)>();
-        trajectoryDetermined = false;
+        geometricIndexesTrajectoryToBeFollowed = new List<int>();
+        geometricTrajectoryToBeFollowedWorld = new List<(float, float)>();
+        smoothGeometricTrajectoryToBeFollowedWorld = new List<(float, float)>();
+        geometricTrajectoryDetermined = false;
         this.smoothTrajWithLoSPS = smoothTrajWithLoSPS;
         this.epsilon = epsilon;
+        this.linearMeanVelocity = linearMeanVelocity;
+        this.qiCouple = qiCouple;
+        this.qfCouple = qfCouple;
     }
 
-    public void DetermineTrajectory(DistanceMap distanceMap, (float startXUnity, float startZUnity) start, (float goalXUnity, float goalZUnity) goal, Planner plannerMode)
+    public void DetermineGeometricTrajectory(DistanceMap distanceMap, (float startXUnity, float startZUnity) start, (float goalXUnity, float goalZUnity) goal, Planner plannerMode)
     {
         this.distanceMap = distanceMap;
 
         if (plannerMode == Planner.A)
         {
             planWithA(distanceMap, start, goal);
-            Debug.Log($"Planned trajectory has {trajectoryToBeFollowedWorld.Count} vertices...");
+            Debug.Log($"Planned trajectory has {geometricTrajectoryToBeFollowedWorld.Count} vertices...");
         }
 
         if (smoothTrajWithLoSPS)
         {
-            smoothTrajectoryWithLOSPS();
-            Debug.Log($"Smoothed planned trajectory has {smoothTrajectoryToBeFollowedWorld.Count} vertices...");
+            smoothGeometricTrajectoryWithLOSPS();
+            Debug.Log($"Smoothed planned trajectory has {smoothGeometricTrajectoryToBeFollowedWorld.Count} vertices...");
         }
 
     }
@@ -73,7 +82,7 @@ public class MotionPlannerService
             if (u_index == goalIndex)
             {
                 (List<int> path, List<(float, float)> pathWorld) paths = distanceMap.ReconstructPath(parentMap, goalIndex, startIndex);
-                setPlannedTrajectory(paths.path, paths.pathWorld);
+                setPlannedGeometricTrajectory(paths.path, paths.pathWorld);
                 return;
             }
 
@@ -100,31 +109,31 @@ public class MotionPlannerService
     // in linea d'aria dentro un tunnel di semi-spessore epsilon (ingombro robot). Elimina gli zig-zag lungo
     // i tratti rettilinei, lasciando i "gomiti" reali imposti dagli ostacoli. Serve come pre-processing:
     // meno vertici e piu' significativi rendono piu' pulito il successivo raffinamento con spline.
-    public void smoothTrajectoryWithLOSPS()
+    public void smoothGeometricTrajectoryWithLOSPS()
     {
-        smoothTrajectoryToBeFollowedWorld = new List<(float, float)>();
+        smoothGeometricTrajectoryToBeFollowedWorld = new List<(float, float)>();
 
-        int n = trajectoryToBeFollowedWorld.Count;
+        int n = geometricTrajectoryToBeFollowedWorld.Count;
         if (n == 0) return;
         if (n <= 2)
         {
-            smoothTrajectoryToBeFollowedWorld.AddRange(trajectoryToBeFollowedWorld);
+            smoothGeometricTrajectoryToBeFollowedWorld.AddRange(geometricTrajectoryToBeFollowedWorld);
             return;
         }
 
-        smoothTrajectoryToBeFollowedWorld.Add(trajectoryToBeFollowedWorld[0]);
+        smoothGeometricTrajectoryToBeFollowedWorld.Add(geometricTrajectoryToBeFollowedWorld[0]);
         int anchor = 0;
         for (int i = 2; i < n; i++)
         {
-            if (!lineOfSightClear(trajectoryToBeFollowedWorld[anchor], trajectoryToBeFollowedWorld[i]))
+            if (!lineOfSightClear(geometricTrajectoryToBeFollowedWorld[anchor], geometricTrajectoryToBeFollowedWorld[i]))
             {
                 // il vertice i non e' piu' visibile dall'anchor: l'ultimo visibile (i-1) e' un gomito
                 // necessario e diventa il nuovo anchor da cui ripartire.
-                smoothTrajectoryToBeFollowedWorld.Add(trajectoryToBeFollowedWorld[i - 1]);
+                smoothGeometricTrajectoryToBeFollowedWorld.Add(geometricTrajectoryToBeFollowedWorld[i - 1]);
                 anchor = i - 1;
             }
         }
-        smoothTrajectoryToBeFollowedWorld.Add(trajectoryToBeFollowedWorld[n - 1]);
+        smoothGeometricTrajectoryToBeFollowedWorld.Add(geometricTrajectoryToBeFollowedWorld[n - 1]);
     }
 
     // Il segmento a->b (coordinate mondo ROS) e' percorribile se, campionandolo, ogni campione resta ad almeno
@@ -159,31 +168,188 @@ public class MotionPlannerService
         return true;
     }
 
-    public bool TrajectoryDetermined()
+    public bool GeometricTrajectoryDetermined()
     {
-        return trajectoryDetermined;
+        return geometricTrajectoryDetermined;
     }
 
-    public void setPlannedTrajectory(List<int> path, List<(float, float)> pathWorld)
+    public void setPlannedGeometricTrajectory(List<int> path, List<(float, float)> pathWorld)
     {
-        this.trajectoryToBeFollowed = path;
-        this.trajectoryToBeFollowedWorld = pathWorld;
-        this.trajectoryDetermined = true;
+        this.geometricIndexesTrajectoryToBeFollowed = path;
+        this.geometricTrajectoryToBeFollowedWorld = pathWorld;
+        this.geometricTrajectoryDetermined = true;
     }
 
-    public List<int> getTrajectory()
+    public List<(float,float)> getGeometricTrajectoryToBeUsed()
     {
-        return trajectoryToBeFollowed;
+        if (smoothTrajWithLoSPS)
+        {
+            return smoothGeometricTrajectoryToBeFollowedWorld;
+        }
+        else
+        { 
+            return geometricTrajectoryToBeFollowedWorld; 
+        }
     }
 
-    public List<(float, float)> getTrajectoryWorld()
+    public List<(float, float)> getGeometricTrajectoryWorld()
     {
-        return trajectoryToBeFollowedWorld;
+        return geometricTrajectoryToBeFollowedWorld;
     }
 
-    public List<(float, float)> getSmoothTrajectoryWorld()
+    public List<(float, float)> getGeometricSmoothTrajectoryWorld()
     {
-        return smoothTrajectoryToBeFollowedWorld;
+        return smoothGeometricTrajectoryToBeFollowedWorld;
+    }
+
+    public void LetsSplineGeometricTrajectory()
+    {
+        List<(float, float)> geomtricTrajectoryTBU = getGeometricTrajectoryToBeUsed();
+        int N = geomtricTrajectoryTBU.Count;
+
+        double v = linearMeanVelocity;
+        
+        (double[] xd, double[] yd, List<double> t) res = getXYTFromGeometricTrajectory(geomtricTrajectoryTBU,v);
+
+        double[] xd = res.xd;
+        double[] yd = res.yd;
+        List<double> t = res.t;
+
+        double[] dt = new double[t.Count-1];
+        for(int i=0; i+1<t.Count; i++)
+        {
+            dt[i] = t[i + 1] - t[i];
+        }
+
+        double qxi = xd[0];
+        double qxf = xd[N - 1];
+        double vel_qxi = qiCouple.vel_qi;
+        double vel_qxf = qfCouple.vel_qf;
+        double acc_qxi = qiCouple.acc_qi;
+        double acc_qxf = qfCouple.acc_qf;
+        double qVirtualStartX0 = qxi + dt[0] * vel_qxi + (dt[0] * dt[0]) / 3 * acc_qxi ;
+        double qVirtualFinalX0 = qxf - dt[N] * vel_qxf + (dt[N] * dt[N]) / 3 * acc_qxf;
+        
+        double qyi = yd[0];
+        double qyf = yd[N - 1];
+        double vel_qyi = qiCouple.vel_qi;
+        double vel_qyf = qfCouple.vel_qf;
+        double acc_qyi = qiCouple.acc_qi;
+        double acc_qyf = qfCouple.acc_qf;
+        double qVirtualStartY0 = qyi + dt[0] * vel_qyi + (dt[0] * dt[0]) / 3 * acc_qyi;
+        double qVirtualFinalY0 = qyf - dt[N] * vel_qyf + (dt[N] * dt[N]) / 3 * acc_qyf;
+
+        //VETTORE q PER LA COORDINATA DESIDERATA X
+        double[] qx = getQVectorForDesiredCoordinate(xd, qVirtualStartX0, qVirtualFinalX0);
+
+        //VETTORE q PER LA COORDINATA DESIDERATA Y
+        double[] qy = getQVectorForDesiredCoordinate(yd, qVirtualStartY0, qVirtualFinalY0);
+
+        //VETTORI a, b E c
+        (double[] a, double[] b, double[] c) abcVectors= getABCVectors(dt);
+        double[] a = abcVectors.a;
+        double[] b = abcVectors.b;
+        double[] c = abcVectors.c;
+
+        //VETTORI DEI TERMINI NOTI, UNO PER COORDINATA
+        double[] dx = new double[N];
+        double[] dy = new double[N];
+        dx = getDVectorForDesiredCoordinate(qx, dt, acc_qxi, acc_qxf);
+        dy = getDVectorForDesiredCoordinate(qy, dt, acc_qyi, acc_qyf);
+
+        double[] xAcc = SolveTridiagonalMatrix(a, b, c, dx);
+        double[] yAcc = SolveTridiagonalMatrix(a, b, c, dy);
+
+    }
+
+    private double[] getQVectorForDesiredCoordinate(double[] xd, double startingVirtual, double finalVirtual)
+    {
+        int N = xd.Length;
+        double[] qx = new double[N + 2];
+        qx[0] = xd[0];                                                           // q_1
+        qx[1] = startingVirtual;                                                 // q_2  (virtuale, parte nota)
+        for (int j = 2; j <= N - 1; j++) qx[j] = xd[j - 1];                      // q_3 ... q_N
+        qx[N] = finalVirtual;                                                    // q_{N+1} (virtuale, parte nota)
+        qx[N + 1] = xd[N - 1];
+        return qx;
+    }
+
+    private double[] getDVectorForDesiredCoordinate(double[] qDesired, double[] dt, double desiredInitialAcc, double desiredFinalAcc)
+    {
+        int N = qDesired.Length - 2;
+        double[] dx = new double[N];
+        dx[0] = 6.0 * qDesired[0] / dt[0] + 6.0 * qDesired[2] / dt[1] - 6.0 * qDesired[1] * (dt[0] + dt[1]) / (dt[0] * dt[1]) - dt[0] * desiredInitialAcc;
+        dx[1] = 6.0 * (qDesired[1] - qDesired[2]) / dt[1] + 6.0 * (qDesired[3] - qDesired[2]) / dt[2];
+        for (int k = 2; k <= N - 3; k++)
+        {
+            dx[k] = 6.0 * (qDesired[k] - qDesired[k + 1]) / dt[k] + 6.0 * (qDesired[k + 2] - qDesired[k + 1]) / dt[k + 1];
+        }
+        dx[N - 2] = 6.0 * (qDesired[N - 2] - qDesired[N - 1]) / dt[N - 2] + 6.0 * (qDesired[N] - qDesired[N - 1]) / dt[N - 1];
+        dx[N - 1] = 6.0 * qDesired[N - 1] / dt[N - 1] + 6.0 * qDesired[N + 1] / dt[N] - 6.0 * qDesired[N] * (dt[N - 1] + dt[N]) / (dt[N - 1] * dt[N]) - dt[N] * desiredFinalAcc;
+        return dx;
+    }
+
+    private (double[] a, double[] b, double[] c) getABCVectors(double[] dt)
+    {
+        int N = dt.Length - 1;
+
+        double[] a = new double[N];
+        double[] b = new double[N];
+        double[] c = new double[N];
+
+        b[0] = (dt[0] + dt[1]) * (2.0 + dt[0] / dt[1]);
+        c[0] = dt[1];
+
+        a[1] = dt[1] - dt[0] * dt[0] / dt[1];
+        b[1] = 2.0 * (dt[1] + dt[2]);
+        c[1] = dt[2];
+
+        for (int k = 2; k <= N - 3; k++)
+        {
+            a[k] = dt[k];
+            b[k] = 2.0 * (dt[k] + dt[k + 1]);
+            c[k] = dt[k + 1];
+        }
+
+        a[N - 2] = dt[N - 2];
+        b[N - 2] = 2.0 * (dt[N - 2] + dt[N - 1]);
+        c[N - 2] = dt[N - 1] - dt[N] * dt[N] / dt[N - 1];
+
+        a[N - 1] = dt[N - 1];
+        b[N - 1] = (dt[N - 1] + dt[N]) * (2.0 + dt[N] / dt[N - 1]);
+
+        return (a, b, c);
+    }
+
+    private (double[] xd, double[] yd, List<double> t) getXYTFromGeometricTrajectory(List<(float, float)> geomtricTrajectoryTBU,double velocity)
+    {
+        int N = geomtricTrajectoryTBU.Count;
+
+        double[] xd = new double[N];
+        double[] yd = new double[N];
+
+        List<double> t = new List<double>();
+
+        int i = 0;
+        xd[i] = geomtricTrajectoryTBU[i].Item1;
+        yd[i] = geomtricTrajectoryTBU[i].Item2;
+        t.Insert(i, 0.0f);
+
+        double dx = 0;
+        double dy = 0;
+
+        while (i + 1 <= N - 1)
+        {
+            xd[i + 1] = geomtricTrajectoryTBU[i + 1].Item1;
+            yd[i + 1] = geomtricTrajectoryTBU[i + 1].Item2;
+            dx = xd[i + 1] - xd[i];
+            dy = yd[i + 1] - yd[i];
+            t.Insert(i + 1, t[i] + (Math.Sqrt(dx * dx + dy * dy) / velocity));
+            i++;
+        }
+
+        return (xd, yd, t);
+
     }
 
 }
