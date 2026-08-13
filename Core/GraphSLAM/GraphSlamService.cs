@@ -148,6 +148,11 @@ public class GraphSlamService
         return globalUpdatedMap;
     }
 
+    public void setUpdatedGlobalMapPointCloud(List<Vector3> cachedGlobalUpdatedMap)
+    {
+        this.globalUpdatedMap = cachedGlobalUpdatedMap;
+    }
+
     public IEnumerable<PoseNode> getGraphNodes()
     {
         return poseGraph.Nodes();
