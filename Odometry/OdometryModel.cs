@@ -27,14 +27,15 @@ public class OdometryModel
         this.wheelRadius = wheelRadius;
     }
 
-    public void ComputeOdometryLocalization(float wL, float wR)
+    public void ComputeOdometryLocalization(float wL, float wR, float dt)
     {
         if (Mathf.Abs(wL) < wheelVelocityThreshold && Mathf.Abs(wR) < wheelVelocityThreshold)
         {
             return;
         }
 
-        float dt = Time.deltaTime;
+        // 'dt' e' il tempo REALE trascorso dall'ultimo update (passato dal service), NON Time.deltaTime:
+        // la localizzazione gira a odometryFrequency, che in genere != frame rate -> Time.deltaTime sotto-integra.
         (float, float) wheelDirectVelocities = GetDirectVelocities(wheelSeparation, wheelRadius, wL, wR);
         float vt = wheelDirectVelocities.Item1;
         float wt = wheelDirectVelocities.Item2;
