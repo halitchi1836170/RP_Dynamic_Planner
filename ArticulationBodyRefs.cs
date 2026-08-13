@@ -63,9 +63,12 @@ public class ArticulationBodyRefs : MonoBehaviour
 
     public (float, float, float) getTransformCurrentConfiguration()
     {
-        float current_xt = transform.position.z; // z perché Unity usa XZ come piano orizzontale
-        float current_yt = transform.position.x;
-        float current_thetat = transform.eulerAngles.y * Mathf.Deg2Rad;
+        // Ancoro il seed dell'odometria al LASER LINK (non alla base): e' lo stesso punto usato dal
+        // riferimento (start = UnityToRos(laser)) e dal controllo/true_pose. Seedare sulla base introdurrebbe
+        // un offset costante di ~0.10 m (il laser e' 0.10 m avanti) che in curva ruota e sembra "drift".
+        float current_xt = marrtionLaserLinkTransform.position.z; // z perché Unity usa XZ come piano orizzontale
+        float current_yt = marrtionLaserLinkTransform.position.x;
+        float current_thetat = marrtionLaserLinkTransform.eulerAngles.y * Mathf.Deg2Rad;
         return (current_xt, current_yt, current_thetat);
     }
 
