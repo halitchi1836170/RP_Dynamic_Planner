@@ -1,6 +1,7 @@
 using System.IO;
 using System.Text;
 using System.Globalization;
+using System.Collections.Generic;
 using UnityEngine;
 
 // Salvataggio/lettura della occupancy grid in formato standard ROS map_server: .pgm (P5 binario) + .yaml.
@@ -129,5 +130,35 @@ public class IOFileOperationService
         int start = pos;
         while (pos < buf.Length && !(buf[pos] == ' ' || buf[pos] == '\n' || buf[pos] == '\r' || buf[pos] == '\t')) pos++;
         return Encoding.ASCII.GetString(buf, start, pos - start);
+    }
+
+    // --------------------------------------------------------------------------------------------
+    //                                     GLOBAL POINT CLOUD
+    // --------------------------------------------------------------------------------------------
+    // Salvataggio/lettura della global point cloud (List<Vector3>) in binario, stessa cartella/nome
+    // della occupancy grid ma estensione .bin. Formato: int32 count, poi count * (float x, y, z) little-endian.
+    public void WriteGlobalPointCloud(List<Vector3> cloud)
+    {
+        if (cloud == null) return;
+        string cloudPath = Path.ChangeExtension(pgmPath, ".bin");
+        using (BinaryWriter bw = new BinaryWriter(new FileStream(cloudPath, FileMode.Create)))
+        {
+            bw.Write(cloud.Count);
+            foreach (Vector3 p in cloud) { bw.Write(p.x); bw.Write(p.y); bw.Write(p.z); }
+        }
+    }
+
+    public List<Vector3> ReadGlobalPointCloud()
+    {
+        string cloudPath = Path.ChangeExtension(pgmPath, ".bin");
+        List<Vector3> cloud = new List<Vector3>();
+        if (!File.Exists(cloudPath)) return cloud;
+        using (BinaryReader br = new BinaryReader(new FileStream(cloudPath, FileMode.Open)))
+        {
+            int n = br.ReadInt32();
+            for (int i = 0; i < n; i++)
+                cloud.Add(new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle()));
+        }
+        return cloud;
     }
 }
