@@ -71,7 +71,9 @@ public class OdometryService
         float wL = wheelAngularVelocities.Item1;
         float wR = wheelAngularVelocities.Item2;
 
-        odometryModel.ComputeOdometryLocalization(wL, wR);
+        // dt REALE dall'ultimo update (non Time.deltaTime): 0 al primo giro, clamp a 0.1s contro eventuali hitch.
+        float dt = (lastTimeOdometry == 0f) ? 0f : Mathf.Min(Time.time - lastTimeOdometry, 0.1f);
+        odometryModel.ComputeOdometryLocalization(wL, wR, dt);
         lastTimeOdometry = Time.time;
 
         this.currentConfiguration = odometryModel.getCurrentUpdatedPosition();
