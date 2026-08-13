@@ -553,16 +553,17 @@ public class PublishingService
 
     // Traiettoria pianificata come nav_msgs/Path. I punti arrivano GIA' in coordinate ROS
     // (frame della griglia, X-Y di "odom"): originX/originY + (col/row)*resolution -> NIENTE UnityToRos.
-    public void PublishPlannedTrajectory(List<(float x, float y)> pathWorld, string topic)
+
+    public void PublishListOfROSPoints(List<(float x, float y)> listPoints, string topic)
     {
-        if (pathWorld == null) return;
+        if (listPoints == null) return;
 
         PathMsg pathMsg = new PathMsg();
         HeaderMsg header = getPointCloud2MsgHeader();   // frame_id "odom", stesso di occupancy/distance map
         pathMsg.header = header;
 
-        List<PoseStampedMsg> poses = new List<PoseStampedMsg>(pathWorld.Count);
-        foreach ((float x, float y) p in pathWorld)
+        List<PoseStampedMsg> poses = new List<PoseStampedMsg>(listPoints.Count);
+        foreach ((float x, float y) p in listPoints)
         {
             PoseStampedMsg ps = new PoseStampedMsg();
             ps.header = header;
@@ -576,6 +577,11 @@ public class PublishingService
         pathMsg.poses = poses.ToArray();
 
         ROSConnection.GetOrCreateInstance().Publish(topic, pathMsg);
+    }
+
+    public void PublishPlannedTrajectory(List<(float x, float y)> pathWorld, string topic)
+    {
+        PublishListOfROSPoints(pathWorld, topic);
     }
 
     // Pubblica un singolo punto (debug) come PointCloud2. Il punto è GIA' in coordinate ROS
@@ -609,4 +615,8 @@ public class PublishingService
         ROSConnection.GetOrCreateInstance().Publish(topic, msg);
     }
 
+    internal void PublishLSplinedGeometricTrajectory(List<(float, float)> list, string topic)
+    {
+        PublishListOfROSPoints(list, topic);
+    }
 }
