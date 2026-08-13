@@ -1,7 +1,7 @@
 using Unity.Mathematics;
 using UnityEngine;
 
-public class UnicycleModelUtilities
+public static class UnicycleModelUtilities
 {
 
     public static (float, float) GetInverseAngularVelocities(float wheelSeparation, float wheelRadius, float v, float w)
