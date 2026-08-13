@@ -4,6 +4,7 @@ using static ICPUtils;
 using static MatrixVectorUtilities;
 using static PoseMatrix4x4;
 using static ICPSolver;
+using MathNet.Numerics.LinearAlgebra.Solvers;
 
 public class ICPService
 {
@@ -11,6 +12,7 @@ public class ICPService
     private float deltaHuber;
     private ICPMode icpMode;
     private int maxIteration;
+    private int maxIterationLocalization;
     private float maxDistance;
     private float convergenceThreshold;
     private float voxelSize;
@@ -40,11 +42,16 @@ public class ICPService
 
     private bool planarConstraintFlag;
 
-    public ICPService(ICPMode icpMode, float deltaHuber, int maxIteration, float maxDistance, float convergenceThreshold, float voxelSize, int nPosesPath, Transform marrtinoLaserLinkTransform, LiDAR3D lidar, GraphSlamService graphSlamService, bool planarConstraintFlag)
+    //FIELDS FOR CONTROLLING MODE
+    private KDTree globalCachedPointCloudKDTree;
+    private List<Vector3> globalCachedPointGloudVoxelGrid;
+
+    public ICPService(ICPMode icpMode, float deltaHuber, int maxIteration, int maxIterationLocalization, float maxDistance, float convergenceThreshold, float voxelSize, int nPosesPath, Transform marrtinoLaserLinkTransform, LiDAR3D lidar, GraphSlamService graphSlamService, bool planarConstraintFlag)
     {
         this.icpMode = icpMode;
         this.deltaHuber = deltaHuber;
         this.maxIteration = maxIteration;
+        this.maxIterationLocalization = maxIterationLocalization;
         this.maxDistance = maxDistance;
         this.convergenceThreshold = convergenceThreshold;
         this.voxelSize = voxelSize;
@@ -61,7 +68,10 @@ public class ICPService
 
         icpPathPositions = new Queue<Vector3>();
         transformedWorldPointsList = new List<Vector3>();
-    }
+
+        globalCachedPointCloudKDTree = new KDTree();
+        globalCachedPointGloudVoxelGrid = new List<Vector3>();
+}
 
     public (Vector3, Queue<Vector3>, List<Vector3>) ScanCompletedRunOneICP()
     {
@@ -122,6 +132,48 @@ public class ICPService
 
         return (icpEstimatedPos, icpPathPositions, transformedWorldPointsList);
 
+    }
+
+    public void SetLocalizationMap(List<Vector3> mapWorldPoints)
+    {
+        VoxelGrid cachedGlobalCloudVoxelGrid = new VoxelGrid();
+        globalCachedPointGloudVoxelGrid = cachedGlobalCloudVoxelGrid.Downsample(mapWorldPoints, 2*voxelSize);
+        globalCachedPointCloudKDTree.BuildTree(globalCachedPointGloudVoxelGrid, 0);
+    }
+
+    public ( float[,] correctedPose, float residual, float inlierRatio) LocalizeAgainstMap(float[,] initialGuessWorldPose)
+    {
+        List<Vector3> source = ToLocalFrame(marrtinoLaserLinkTransform,sourceVoxelGrid.Downsample(lidar3d.ScannedPoints,voxelSize));
+        float[,] corrected = ICPSolver.Solve(initialGuessWorldPose, globalCachedPointCloudKDTree, globalCachedPointGloudVoxelGrid, source, deltaHuber, maxIterationLocalization, maxDistance, convergenceThreshold, icpMode);
+
+        // Proietto sul piano PRIMA della fitness: cosi' residual/inlierRatio descrivono la posa che restituisco.
+        if (planarConstraintFlag)
+        {
+            corrected = projectPoseToPlane(corrected);
+        }
+
+        List<Vector3> worldSource = new List<Vector3>();
+        foreach(Vector3 p in source)
+        {
+            worldSource.Add(applyTransformation(corrected, p));
+        }
+
+        List<(int queryIdx, int targetIdx, float distance)> corr = globalCachedPointCloudKDTree.FindCorrespondences(worldSource, maxDistance * maxDistance);
+        float inlierRatio = worldSource.Count > 0 ? (float)corr.Count / worldSource.Count : 0.0f;   // cast: evita la divisione INTERA (sempre 0)
+        float residual = float.MaxValue;
+        if (corr.Count > 0)
+        {
+            residual = 0.0f;
+            foreach(var p in corr)
+            {
+                residual += Mathf.Sqrt(p.distance);   // p.distance e' AL QUADRATO (da NearestNeighbor) -> sqrt = metri
+            }
+            residual = residual / corr.Count;
+        }
+
+        //Debug.Log($"Residual: {residual}, InlierRatio: {inlierRatio}");   // OFF: log a ~10 Hz -> editor lentissimo (stack trace + Console)
+
+        return (corrected, residual, inlierRatio);
     }
 
     public float[,] getTWorldICP()

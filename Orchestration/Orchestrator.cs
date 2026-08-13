@@ -38,8 +38,13 @@ public class Orchestrator : MonoBehaviour
     public string distanceMapRosTopic = "/distanceMap";
     public string plannedTrajectoryRosTopic = "/planned_path";
     public string smoothedTrajectoryRosTopic = "/smoothed_path";
+    public string splinedTrajectoryRosTopic = "/splined_path";
     public string startDebugRosTopic = "/debug/start_pose";
+    public string waypointsDebugRosTopic = "/debug/waypoints";
     public string goalDebugRosTopic = "/debug/goal_pose";
+    public string currentPoseDebugRosTopic = "/debug/current_pose";   // posa corrente (odometria di ruota) in frame ROS
+    public string truePoseDebugRosTopic = "/debug/true_pose";         // posa VERA (transform live -> ROS), solo debug
+    public string icpPoseLocalizationDebugRosTopic = "/debug/localization/icp_pose";
 
     public string GRASLAMFIELDS = "FOLLOWING GRAPH SLAM FIELDS";
     public float minDeltaTranslation = 0.1f;
@@ -57,6 +62,12 @@ public class Orchestrator : MonoBehaviour
     public int secondsFrequencyLoopClosureFinder = 15;
     public bool planarConstraintFlag = true;
     public float huberDeltaGraphSlamOptimization = 0.5f;
+    private List<Vector3> updatedGlobalPointCloudCached;
+    private bool updatedGlobalPointCloudReady = false;
+    private float lastGlobalPointCloudPublish = 0f;
+    private float globalPointCloudPeriod = 5.0f;
+    private KDTree cachedGlobalPointCloudKDTree;
+    private VoxelGrid cachedGlobalCloudVoxelGrid;
 
     public string ODOMETRYFILEDS = "FOLLOWING ODOMETRY FIELDS";
     public float angularVelocityThreshold = 0.001f;
@@ -64,6 +75,10 @@ public class Orchestrator : MonoBehaviour
     public float odometryFrequency = 55.0f; //Hz
     public bool publishLastNOdometryPoses = true;
     public int NOdometryLastPoses = 250;
+    // La localizzazione integra a odometryFrequency (55 Hz), ma la PATH (250 pose) va PUBBLICATA a rate basso:
+    // a 55 Hz satura la coda TCP (Queue full -> messaggi droppati) e genera allocazioni GC ad ogni frame.
+    public float odometryPathPublishPeriod = 0.2f;   // 5 Hz
+    private float lastOdometryPathPublish = 0f;
 
     public string OCCUPANCYGRIDFIELDS = "FOOLLOWING OCCUPANCY GRID FIELDS";
     public float resolution = 0.02f;
@@ -75,18 +90,24 @@ public class Orchestrator : MonoBehaviour
     public float elevThrehsold = 6;
     public bool calculateAndOverrideOccupancyMapFlag = false;
     public string occupancyGridMapFileName = "occupancyGridMap";
+    // In navigazione (mappa gia' costruita) la occupancy si legge UNA volta e si ripubblica throttlata,
+    // invece di rileggerla da disco ad ogni scan.
+    public float occupancyRepublishPeriod = 5.0f;
+    private (sbyte[], int, int, float, float, float) occupancyGridCached;
+    private bool occupancyGridCachedReady = false;
+    private float lastOccupancyPublish = 0f;
 
     public string DISTANCEMAPFIELDS = "FOLLOWING DISTANCE MAP FIELDS";
     public float obstacleThreshold = 50f;
-    public float distanceMapRepublishPeriod = 1.0f;
+    public float distanceMapRepublishPeriod = 5.0f;
     private bool distanceMapComputed = false;
     private float lastDistanceMapPublish = 0f;
 
-    public string MOTIONPLANNINGFILED = "FOLLOWING MOTION PLANNING FIELDS";
+    public string MOTIONPLANNINGFIELDS = "FOLLOWING MOTION PLANNING FIELDS";
     public bool goalSettedLetsPlan = true;
-    public bool controlTrajectory = false;
-    public float goalXUnity = -4f;
-    public float goalZUnity = 1.5f;
+    public float goalXUnity = -1f;
+    public float goalZUnity = -2.5f;
+    public string goalStateObjectName = "GOAL STATE";   // waypoint da scena: oggetti "1_NODE","2_NODE",... poi questo
     public Planner plannerMode = Planner.A;
     public float k = 50f;
     public float eps = 0.01f;
@@ -97,10 +118,33 @@ public class Orchestrator : MonoBehaviour
     private (float x, float y) goalDebugPoint;
     public bool smoothTrajWithLoSPS = true;
     public float epsilonTunnelLoSPS = 0.25f; // Dall'URDF: box base 0.28x0.37 m -> raggio circoscritto ~0.23 m; 0.25 m aggiunge un piccolo margine.
-    public float linearMeanVelocity = 15.0f;
-    public (double vel_qi, double acc_qi) qiCouple = (0.0, 0.0);
+    public float linearMeanVelocity = 0.3f;
+    public (double vel_qi, double acc_qi) qiCouple = (0.0, 0.0);            //unico vettore perché suppongo gli stessi valori sia per x che y 
     public (double vel_qf, double acc_qf) qfCouple = (0.0, 0.0);
+    public int subSamplesPerSpline = 30;
+    private List<(float, float)> waypoints;
 
+    public string CONTROLSTRAtEGIESFIELDS = "FOLLOWING CONTROL SERVICE FIELDS";
+    public int secondsControlFrequency = 20;
+    public bool boolControlMarrtino = true;
+    public ControlStrategy controlStrategy = ControlStrategy.NonlinearControl;
+    public bool controlOnGroundTruth = false;
+    public bool flipControlOmega = true;
+    private (float x, float y, float theta) currentConfig;
+    public float b = 10.0f;
+    public float zeta = 0.8f;
+    public float vMax = 0.5f;       // circa 1.5 volte linearMeanVelocity
+    public float wMax = 2.0f;        // cap di CURVATURA del profilo (rallenta in curva): tienilo fisico ~2
+    public float wMaxClamp = 4.0f;   // clamp di sicurezza su omega del controller: > wMax, da' margine al feedback
+    public float aMax = 0.2f;
+    public bool useICPLocalization = true;
+    public float minInlierRatio = 0.6f;      // frazione minima di scansione spiegata dalla mappa
+    public float maxResidual = 0.25f;        // errore medio max [m]; ~2-3x voxelSize
+    public float localizationPeriod = 0.35f;  // l'ICP e' costoso: correggi a ~10 Hz, non ogni frame
+    public float maxLocalizationJump = 0.4f;  // salto max [m] corrected-vs-guess: oltre -> convergenza ICP errata, scarto
+    private float lastLocalization = 0f;
+    private (float x, float y, float theta) icpLocalizedConfig;
+    public int maxIterationLocalization = 7;
 
     //--------------------------------------------------------------------------------------------------------------------------------------------------------
     //                                                                    HARDWARE FIELDS
@@ -108,8 +152,11 @@ public class Orchestrator : MonoBehaviour
     ArticulationBodyRefs articulationBodiesRefs;
     private ArticulationBody leftWheel;
     private ArticulationBody rightWheel;
+    private float wheelRadius;
+    private float wheelSeparation;
     private LiDAR3D lidar;
     private Transform marrtionLaserLinkTransform;
+    private DifferentialDriveController differentialDriveController;
 
 
 
@@ -127,6 +174,7 @@ public class Orchestrator : MonoBehaviour
     private DistanceMapService distanceMapService;
     private MotionPlannerService motionPlannerService;
     private ControllerService controllerService;
+    private LocalizationService localizationService;
 
     //--------------------------------------------------------------------------------------------------------------------------------------------------------
     //                                                                       ROBOT STATE
@@ -138,10 +186,13 @@ public class Orchestrator : MonoBehaviour
     {
         articulationBodiesRefs = this.GetComponent<ArticulationBodyRefs>();
         (ArticulationBody lw, ArticulationBody rw) wheels = articulationBodiesRefs.getWheelArticulationBodyReference();
-        leftWheel = wheels.lw;
-        rightWheel = wheels.rw;
+        this.leftWheel = wheels.lw;
+        this.rightWheel = wheels.rw;
+        this.wheelRadius = articulationBodiesRefs.wheelRadius;
+        this.wheelSeparation = articulationBodiesRefs.wheelSeparation;
         lidar = articulationBodiesRefs.getMarrtinoLaserLinkArticulationBodyReference().GetComponent<LiDAR3D>();
         marrtionLaserLinkTransform = articulationBodiesRefs.getMarrtinoLaserLinkTransformReference();
+        differentialDriveController = this.GetComponent<DifferentialDriveController>();
 
         //Debug.Log($"left wheel body var test name: {leftWheel.name}");
     }
@@ -159,18 +210,20 @@ public class Orchestrator : MonoBehaviour
 
         //------------------INIZIALIZZAZIONE SERVIZI
         graphSlamService = new GraphSlamService(maxIterations, maxCGIterations, graphSlamOptimizerConvergenceThreshold, CGConvergenceThreshold, minDeltaTranslation, minDeltaRotation, huberDeltaGraphSlamOptimization);
-        icpService = new ICPService(icpMode, deltaHuber, maxIteration, maxDistance, convergenceThreshold, voxelSize, nPosesPath, marrtionLaserLinkTransform, lidar, graphSlamService, planarConstraintFlag);
+        icpService = new ICPService(icpMode, deltaHuber, maxIteration, maxIterationLocalization, maxDistance, convergenceThreshold, voxelSize, nPosesPath, marrtionLaserLinkTransform, lidar, graphSlamService, planarConstraintFlag);
         publisherService = new PublishingService();
         odometryService = new OdometryService(angularVelocityThreshold, wheelVelocityThreshold, odometryFrequency, articulationBodiesRefs, publishLastNOdometryPoses, NOdometryLastPoses);
         loopClosureFinderService = new LoopClosureFinderService(halfConeAngleLoopClosureFinder, k_midDeltaIDBetweenCandidates, secondsFrequencyLoopClosureFinder, maxRadiusLoopClosureFinder, thresholdLoopClosure);
         occupancyGridService = new OccupancyGridService(resolution, zMin, zMax, probOcc, probFree, occBlockThreshold, elevThrehsold);
         ioService = new IOFileOperationService(occupancyGridMapFileName);
         distanceMapService = new DistanceMapService(obstacleThreshold, k, eps);
-        motionPlannerService = new MotionPlannerService(smoothTrajWithLoSPS, epsilonTunnelLoSPS, linearMeanVelocity, qiCouple, qfCouple);
-        controllerService = new ControllerService();
+        motionPlannerService = new MotionPlannerService(smoothTrajWithLoSPS, epsilonTunnelLoSPS, linearMeanVelocity, qiCouple, qfCouple, subSamplesPerSpline, secondsControlFrequency, wMax, aMax, vMax);
+        controllerService = new ControllerService(secondsControlFrequency, controlStrategy, (leftWheel, rightWheel), wheelRadius, wheelSeparation, b, zeta, vMax, wMaxClamp);
+        localizationService = new LocalizationService(icpService, marrtionLaserLinkTransform, minInlierRatio, maxResidual, maxLocalizationJump);
 
         //------------------REGISTRAZIONE EVENTI
-        lidar.OnScanComplete += ScanCompletedLetsWork;
+        if (calculateAndOverrideOccupancyMapFlag)
+            lidar.OnScanComplete += ScanCompletedLetsWork;
         Invoke("ClearVisualizationTopics", 1.5f);
 
 
@@ -190,31 +243,50 @@ public class Orchestrator : MonoBehaviour
         ROSConnection.GetOrCreateInstance().RegisterPublisher<OccupancyGridMsg>(distanceMapRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PathMsg>(plannedTrajectoryRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PathMsg>(smoothedTrajectoryRosTopic);
+        ROSConnection.GetOrCreateInstance().RegisterPublisher<PathMsg>(splinedTrajectoryRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(startDebugRosTopic);
+        ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(waypointsDebugRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(goalDebugRosTopic);
+        ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(currentPoseDebugRosTopic);
+        ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(truePoseDebugRosTopic);
+        ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(icpPoseLocalizationDebugRosTopic);
 
         //------------------ONE TIME ACTIONS
         if (calculateAndOverrideOccupancyMapFlag == false)
         {
-            distanceMapService.SetOccupancyGridMap(ioService.ReadOccupancyGrid());
+            List<Vector3> globalStoredUpdatedMap = ioService.ReadGlobalPointCloud();
+            updatedGlobalPointCloudCached = globalStoredUpdatedMap;
+            updatedGlobalPointCloudReady = true;
+            graphSlamService.setUpdatedGlobalMapPointCloud(updatedGlobalPointCloudCached);
+            publisherService.PublishUpdatedGlobalPointCloudMap(updatedGlobalPointCloudCached, graphSlamGlobalpointCloudTopic);
+            icpService.SetLocalizationMap(updatedGlobalPointCloudCached);
+            localizationService.Initialize();
+            icpLocalizedConfig = localizationService.GetRosPose();   // posa iniziale nota, prima del primo Step
+
+            (sbyte[], int, int, float, float, float) occGrid = ioService.ReadOccupancyGrid();
+            occupancyGridCached = occGrid;               // cache per la ripubblicazione throttlata in Update
+            occupancyGridCachedReady = true;
+            distanceMapService.SetOccupancyGridMap(occGrid);
             distanceMapService.calculateDistanceMap();
             publisherService.PublishDistanceMap(distanceMapService.getDistanceMapForPublisher(), distanceMapRosTopic);
             distanceMapComputed = true;
 
             if (goalSettedLetsPlan)
             {
-                (float sx, float sy, float sz) start = UnityToRosPosition(marrtionLaserLinkTransform.position.x, marrtionLaserLinkTransform.position.y, marrtionLaserLinkTransform.position.z);
-                (float gx, float gy, float gz) goal = UnityToRosPosition(goalXUnity, 0, goalZUnity);
-                startDebugPoint = (start.sx, start.sy);
-                goalDebugPoint = (goal.gx, goal.gy);
-                motionPlannerService.DetermineGeometricTrajectory(distanceMapService.getDistanceMapInstance(), startDebugPoint, goalDebugPoint, plannerMode);
+                waypoints = readWaypointNodes();   // [start (robot), 1_NODE, 2_NODE, ..., GOAL]
+                startDebugPoint = waypoints[0];
+                goalDebugPoint = waypoints[waypoints.Count - 1];
+                motionPlannerService.DetermineGeometricTrajectoryFromWaypoints(distanceMapService.getDistanceMapInstance(), waypoints, plannerMode);
                 trajectoryPlanned = motionPlannerService.GeometricTrajectoryDetermined();
                 motionPlannerService.LetsSplineGeometricTrajectory();
+                motionPlannerService.DetermineGeomtricTrajectoryFromSplines();
             }
 
-            if(motionPlannerService.GeometricTrajectoryDetermined() && controlTrajectory)
+            if(motionPlannerService.GeometricTrajectoryDetermined() && boolControlMarrtino)
             {
-                controllerService.FollowTrajectory();
+                controllerService.Arm(motionPlannerService.getGeometricTrajectoryForController());
+                if (differentialDriveController != null) differentialDriveController.autonomousControlActive = true;   // la tastiera si fa da parte
+                //controllerService.FollowTrajectory(motionPlannerService.getGeometricTrajectoryForController());
             }
 
         }
@@ -229,11 +301,35 @@ public class Orchestrator : MonoBehaviour
             lastDistanceMapPublish = Time.time;
         }
 
-        if(trajectoryPlanned && Time.time - lastTrajectoryPublish > plannedTrajectoryRepublishPeriod)
+        if (occupancyGridCachedReady && Time.time - lastOccupancyPublish > occupancyRepublishPeriod)
+        {
+            publisherService.PublishOccupancyGridMap(occupancyGridCached, occupancyRosTopic);
+            lastOccupancyPublish = Time.time;
+        }
+
+        if( updatedGlobalPointCloudReady && Time.time - lastGlobalPointCloudPublish > globalPointCloudPeriod)
+        {
+            publisherService.PublishUpdatedGlobalPointCloudMap(updatedGlobalPointCloudCached, graphSlamGlobalpointCloudTopic);
+            lastGlobalPointCloudPublish = Time.time;
+        }
+
+        if( (!calculateAndOverrideOccupancyMapFlag) && boolControlMarrtino && trajectoryPlanned && Time.time - lastTrajectoryPublish > plannedTrajectoryRepublishPeriod)
         {
             publisherService.PublishPlannedTrajectory(motionPlannerService.getGeometricTrajectoryWorld(), plannedTrajectoryRosTopic);
             if (smoothTrajWithLoSPS) publisherService.PublishPlannedTrajectory(motionPlannerService.getGeometricSmoothTrajectoryWorld(), smoothedTrajectoryRosTopic);
+            publisherService.PublishLSplinedGeometricTrajectory(motionPlannerService.getSplinedGeomtricTrajectory(), splinedTrajectoryRosTopic);
             publisherService.PublishDebugPoint(startDebugPoint, startDebugRosTopic);
+            if(waypoints.Count > 0)
+            {
+                int i = 0;
+                List<(float x, float y)> listWayPoints = new List<(float, float)>();
+                while (i < waypoints.Count - 1)
+                {
+                    listWayPoints.Add((waypoints[i]));
+                    i += 1;
+                }
+                publisherService.PublishListOfROSPoints(listWayPoints, waypointsDebugRosTopic);
+            }
             publisherService.PublishDebugPoint(goalDebugPoint, goalDebugRosTopic);
             lastTrajectoryPublish = Time.time;
         }
@@ -241,26 +337,101 @@ public class Orchestrator : MonoBehaviour
         if (odometryService.isTimeToLocalize())
         {
             odometryService.letsLocalizeUsingOdometry();
-            (float xt, float yt, float thetat) currentConfig= odometryService.getUpdatedConfiguration();
+            currentConfig= odometryService.getUpdatedConfiguration();
 
             publisherService.PublishTF(currentConfig, marrtionLaserLinkTransform.localPosition, marrtionLaserLinkTransform.localRotation, tfRosTopic);
 
             publisherService.PublishLastOdometry(currentConfig, odometryRosTopic);
 
-            if (publishLastNOdometryPoses)
+            publisherService.PublishDebugPoint((currentConfig.x, -currentConfig.y), currentPoseDebugRosTopic);
+            (float trx, float trY, float trz) truePose = UnityToRosPosition(marrtionLaserLinkTransform.position.x, marrtionLaserLinkTransform.position.y, marrtionLaserLinkTransform.position.z);
+            publisherService.PublishDebugPoint((truePose.trx, truePose.trY), truePoseDebugRosTopic);
+
+            if (publishLastNOdometryPoses && Time.time - lastOdometryPathPublish > odometryPathPublishPeriod)
             {
                 publisherService.PublishOdometryPath(odometryService.getUpdatedLastOdometryPoses(), odometryPathRosTopic);
-            }
+                lastOdometryPathPublish = Time.time;
 
-            //Debug.Log($"occupancy cells = {occupancyGridService.getOccupancyGridMap().Count}");
+                // DIAGNOSTICO odometria: confronto posa+heading odometria vs VERITA' (frame ROS).
+                // thetaOdo dovrebbe seguire eulerAngles.y. Se diverge l'ANGOLO -> bug heading; se diverge solo
+                // la POSIZIONE con angolo giusto -> scala/slip su v.
+                //Debug.Log($"ODO pos=({currentConfig.x:F3},{-currentConfig.y:F3}) thetaOdo={currentConfig.theta * Mathf.Rad2Deg:F1}  |  TRUE pos=({truePose.trx:F3},{truePose.trY:F3}) eulerY={marrtionLaserLinkTransform.eulerAngles.y:F1}");
+            }
 
         }
 
-        // Ventaglio del cono di ricerca, centrato sul robot live, pubblicato ogni frame (solo in TimeAndCone).
-        if (loopClosureMode == LoopClosureFinder.TimeAndConeBased)
+        // Localizzazione scan-to-map: predict->correct->gate a ~localizationPeriod; posa pubblicata per RViz.
+        if (useICPLocalization && odometryService.isRobotMoving() && Time.time - lastLocalization > localizationPeriod)
+        {
+            (float lx, float ly, float lth, bool accepted) = localizationService.Step(odometryService.getUpdatedConfiguration());
+            icpLocalizedConfig = (lx, ly, lth);
+            publisherService.PublishDebugPoint((lx, ly), icpPoseLocalizationDebugRosTopic);
+            lastLocalization = Time.time;
+        }
+
+        if( (!calculateAndOverrideOccupancyMapFlag) && boolControlMarrtino && controllerService.isTimeToControl())
+        {
+            (float x, float y, float theta) currentConfigRos;
+            if (controlOnGroundTruth)
+            {
+                (float grx, float gry, float grz) gt = UnityToRosPosition(marrtionLaserLinkTransform.position.x, marrtionLaserLinkTransform.position.y, marrtionLaserLinkTransform.position.z);
+                float gtTheta = Mathf.Atan2(-marrtionLaserLinkTransform.forward.x, marrtionLaserLinkTransform.forward.z);
+                currentConfigRos = (gt.grx, gt.gry, gtTheta);
+            }
+            else if (useICPLocalization)
+            {
+                currentConfigRos = icpLocalizedConfig;
+            }
+            else
+            {
+                (float xo, float yo, float tho) = odometryService.getUpdatedConfiguration();
+                currentConfigRos = (xo, -yo, -tho);
+            }
+
+            (double v, double w) feedbackControl = controllerService.ControlStep(currentConfigRos);
+
+            if (flipControlOmega) feedbackControl.w = -feedbackControl.w;
+            controllerService.applyToWheels(feedbackControl);
+        }
+
+     
+        if (calculateAndOverrideOccupancyMapFlag && loopClosureMode == LoopClosureFinder.TimeAndConeBased)
         {
             publisherService.PublishConeFan(marrtionLaserLinkTransform.position, marrtionLaserLinkTransform.forward, halfConeAngleLoopClosureFinder, thresholdLoopClosure, maxRadiusLoopClosureFinder, coneFanTopic);
         }
+    }
+
+    // Legge i waypoint dalla scena: start (posa laser) + oggetti "1_NODE","2_NODE",... (numerazione contigua,
+    // mi fermo al primo mancante) + "GOAL STATE" (fallback ai goalXUnity/goalZUnity se assente). Tutto in frame ROS.
+    private List<(float, float)> readWaypointNodes()
+    {
+        List<(float, float)> waypoints = new List<(float, float)>();
+
+        (float sx, float sy, float sz) start = UnityToRosPosition(marrtionLaserLinkTransform.position.x, marrtionLaserLinkTransform.position.y, marrtionLaserLinkTransform.position.z);
+        waypoints.Add((start.sx, start.sy));
+
+        int i = 1;
+        GameObject node;
+        while ((node = GameObject.Find($"{i}_NODE")) != null)
+        {
+            (float nx, float ny, float nz) n = UnityToRosPosition(node.transform.position.x, node.transform.position.y, node.transform.position.z);
+            waypoints.Add((n.nx, n.ny));
+            i++;
+        }
+
+        GameObject goalObj = GameObject.Find(goalStateObjectName);
+        if (goalObj != null)
+        {
+            (float gx, float gy, float gz) g = UnityToRosPosition(goalObj.transform.position.x, goalObj.transform.position.y, goalObj.transform.position.z);
+            waypoints.Add((g.gx, g.gy));
+        }
+        else
+        {
+            (float gx, float gy, float gz) g = UnityToRosPosition(goalXUnity, 0, goalZUnity);   // fallback hard-coded
+            waypoints.Add((g.gx, g.gy));
+        }
+
+        return waypoints;
     }
 
     void ClearVisualizationTopics()
@@ -268,7 +439,19 @@ public class Orchestrator : MonoBehaviour
         publisherService.PublishEmptyPointCloud(graphSlamNodesTopic);
         publisherService.PublishEmptyPointCloud(loopClosureCircleTopic);
         publisherService.PublishEmptyPointCloud(loopClosureEdgesTopic);
-        publisherService.PublishEmptyPointCloud(graphSlamGlobalpointCloudTopic);
+        publisherService.PublishEmptyPointCloud(coneFanTopic);                       // in navigazione non si aggiorna piu'
+        publisherService.PublishICPPath(new Queue<Vector3>(), icpPathRosTopic);      // path vuota -> ripulisce /icp/path
+        publisherService.PublishEmptyPointCloud(startDebugRosTopic);
+        publisherService.PublishEmptyPointCloud(goalDebugRosTopic);
+
+        if (!boolControlMarrtino)
+        {
+            publisherService.PublishEmptyPointCloud(graphSlamGlobalpointCloudTopic);
+            publisherService.PublishEmptyPointCloud(plannedTrajectoryRosTopic);
+            publisherService.PublishEmptyPointCloud(smoothedTrajectoryRosTopic);
+            publisherService.PublishEmptyPointCloud(splinedTrajectoryRosTopic);
+        }
+
     }
 
     void ScanCompletedLetsWork()
@@ -321,13 +504,7 @@ public class Orchestrator : MonoBehaviour
 
         publisherService.PublishICPMap(updatedWorld.transformedWorldPointsList, icpMapRosTopic);
 
-        if (calculateAndOverrideOccupancyMapFlag) {
-            publisherService.PublishOccupancyGridMap(occupancyGridService.getDataForPublisher(), occupancyRosTopic);
-        }
-        else
-        {
-            publisherService.PublishOccupancyGridMap(ioService.ReadOccupancyGrid(), occupancyRosTopic);
-        }
+        publisherService.PublishOccupancyGridMap(occupancyGridService.getDataForPublisher(), occupancyRosTopic);
 
     }
 
@@ -398,6 +575,7 @@ public class Orchestrator : MonoBehaviour
             {
                 var d = occupancyGridService.getDataForPublisher();   // (data, W, H, originX, originY, resolution)
                 ioService.WriteOccupancyGrid(d.Item1, d.Item2, d.Item3, d.Item6, d.Item4, d.Item5);
+                ioService.WriteGlobalPointCloud(icpService.ICPToWorldPositionListVectors(graphSlamService.getUpdatedGlobalMapPointCloud()));
             }
 
             publisherService.PublishUpdatedGlobalPointCloudMap( icpService.ICPToWorldPositionListVectors(graphSlamService.getUpdatedGlobalMapPointCloud()) , graphSlamGlobalpointCloudTopic);
