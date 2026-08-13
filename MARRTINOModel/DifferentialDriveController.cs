@@ -15,6 +15,10 @@ public class DifferentialDriveController : MonoBehaviour
     private float lastROSVelocityCommandTime = 0.0f;
     public float thresholdBeforeKeybordControl = 0.5f;
 
+    // Quando il controllo autonomo (ControllerService) guida le ruote, la tastiera DEVE farsi da parte:
+    // altrimenti il ramo tastiera scrive targetVelocity=0 ad ogni frame e stomba il comando autonomo.
+    public bool autonomousControlActive = false;
+
     private ArticulationBodyRefs articulationBodyRefs;
     private ArticulationBody leftWheel;
     private ArticulationBody rightWheel;
@@ -45,6 +49,8 @@ public class DifferentialDriveController : MonoBehaviour
     {
         // TODO: leggere input frecce (su/giù = lineare, sinistra/destra = angolare)
         // e ricavare v (velocità lineare) e omega (velocità angolare del robot)
+
+        if (autonomousControlActive) return;   // il ControllerService ha il controllo esclusivo delle ruote
 
         bool rosIsActive = (Time.time - lastROSVelocityCommandTime) < thresholdBeforeKeybordControl;
 
