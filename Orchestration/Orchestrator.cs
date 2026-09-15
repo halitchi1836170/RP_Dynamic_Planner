@@ -45,6 +45,8 @@ public class Orchestrator : MonoBehaviour
     public string currentPoseDebugRosTopic = "/debug/current_pose";   // posa corrente (odometria di ruota) in frame ROS
     public string truePoseDebugRosTopic = "/debug/true_pose";         // posa VERA (transform live -> ROS), solo debug
     public string icpPoseLocalizationDebugRosTopic = "/debug/localization/icp_pose";
+    public string dynamicObstaclesRosTopic = "/debug/dynamic_obstacles";
+    public string trackedObstaclesRosTopic = "/debug/tracked_obstacles";
 
     public string GRASLAMFIELDS = "FOLLOWING GRAPH SLAM FIELDS";
     public float minDeltaTranslation = 0.1f;
@@ -84,6 +86,7 @@ public class Orchestrator : MonoBehaviour
     public float resolution = 0.02f;
     public float zMin = 0.2f;
     public float zMax = 1.0f;
+    public float bodyRadius = 0.45f;
     public float probOcc = 0.75f;  // Se rileva un ostacolo, mi fido al 75%
     public float probFree = 0.35f; // Se non rileva nulla, la probabilità che ci sia un ostacolo scende al 35%
     public float occBlockThreshold = 1.8f;
@@ -146,6 +149,20 @@ public class Orchestrator : MonoBehaviour
     private (float x, float y, float theta) icpLocalizedConfig;
     public int maxIterationLocalization = 7;
 
+    public string OBSTACLESMANAGERFILEDS = "FOLLOWING DYNAMIC OBSTACLES MANAGER FIELDS";
+    private List<(float cx, float cy, float r)> obstaclesCentroidsSensed;
+    public float obsTol = 0.2f;             // tolleranza "spiegato dalla mappa" a range 0 [m]: tol(d) = obsTol + obsTolPerMeter*d
+    public float obsTolPerMeter = 0.03f;    // crescita della tolleranza col range (errore di heading + rumore + chamfer)
+    public float maxDetectionRange = 3.5f;  // oltre: punti ignorati (alla CBF servono solo gli ostacoli vicini)
+    public float clusteringRadius = 0.3f;
+    public int minClusterPoints = 4;       // sotto = rumore (punti gia' downsampled a voxelSize)
+    public float clusterMargin = 0.05f;    // margine sul raggio del cerchio di ingombro [m]
+    public float trackGate = 0.5f;          // associazione detection-track: distanza max [m]
+    public float trackAlphaLowpass = 0.3f;  // filtro sulla velocita' stimata
+    public float trackVDeadzone = 0.05f;    // sotto: velocita' = 0 (jitter del centroide) [m/s]
+    public int trackMinHits = 3;            // scan consecutivi per confermare un track
+    public float trackForgetTime = 1.0f;    // track non visto da piu' di tanto: rimosso [s]
+
     //--------------------------------------------------------------------------------------------------------------------------------------------------------
     //                                                                    HARDWARE FIELDS
     //--------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -175,6 +192,8 @@ public class Orchestrator : MonoBehaviour
     private MotionPlannerService motionPlannerService;
     private ControllerService controllerService;
     private LocalizationService localizationService;
+    private DynamicObstacleService dynamicObstacleService;
+    private ObstacleTrackerService obstacleTrackerService;
 
     //--------------------------------------------------------------------------------------------------------------------------------------------------------
     //                                                                       ROBOT STATE
@@ -214,16 +233,21 @@ public class Orchestrator : MonoBehaviour
         publisherService = new PublishingService();
         odometryService = new OdometryService(angularVelocityThreshold, wheelVelocityThreshold, odometryFrequency, articulationBodiesRefs, publishLastNOdometryPoses, NOdometryLastPoses);
         loopClosureFinderService = new LoopClosureFinderService(halfConeAngleLoopClosureFinder, k_midDeltaIDBetweenCandidates, secondsFrequencyLoopClosureFinder, maxRadiusLoopClosureFinder, thresholdLoopClosure);
-        occupancyGridService = new OccupancyGridService(resolution, zMin, zMax, probOcc, probFree, occBlockThreshold, elevThrehsold);
+        occupancyGridService = new OccupancyGridService(resolution, zMin, zMax, bodyRadius, probOcc, probFree, occBlockThreshold, elevThrehsold);
         ioService = new IOFileOperationService(occupancyGridMapFileName);
         distanceMapService = new DistanceMapService(obstacleThreshold, k, eps);
         motionPlannerService = new MotionPlannerService(smoothTrajWithLoSPS, epsilonTunnelLoSPS, linearMeanVelocity, qiCouple, qfCouple, subSamplesPerSpline, secondsControlFrequency, wMax, aMax, vMax);
         controllerService = new ControllerService(secondsControlFrequency, controlStrategy, (leftWheel, rightWheel), wheelRadius, wheelSeparation, b, zeta, vMax, wMaxClamp);
         localizationService = new LocalizationService(icpService, marrtionLaserLinkTransform, minInlierRatio, maxResidual, maxLocalizationJump);
+        dynamicObstacleService = new DynamicObstacleService(voxelSize, marrtionLaserLinkTransform, zMin, zMax, bodyRadius, obsTol, obsTolPerMeter, maxDetectionRange, clusteringRadius, minClusterPoints, clusterMargin);
+        obstacleTrackerService = new ObstacleTrackerService(trackGate, trackAlphaLowpass, trackVDeadzone, trackMinHits, trackForgetTime);
+
 
         //------------------REGISTRAZIONE EVENTI
         if (calculateAndOverrideOccupancyMapFlag)
             lidar.OnScanComplete += ScanCompletedLetsWork;
+        else
+            lidar.OnScanComplete += ScanCompletedNavigation;
         Invoke("ClearVisualizationTopics", 1.5f);
 
 
@@ -245,11 +269,13 @@ public class Orchestrator : MonoBehaviour
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PathMsg>(smoothedTrajectoryRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PathMsg>(splinedTrajectoryRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(startDebugRosTopic);
-        ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(waypointsDebugRosTopic);
+        ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(waypointsDebugRosTopic);          // PublishListOfROSPoints manda un nav_msgs/Path
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(goalDebugRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(currentPoseDebugRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(truePoseDebugRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(icpPoseLocalizationDebugRosTopic);
+        ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(dynamicObstaclesRosTopic);
+        ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(trackedObstaclesRosTopic);
 
         //------------------ONE TIME ACTIONS
         if (calculateAndOverrideOccupancyMapFlag == false)
@@ -328,7 +354,7 @@ public class Orchestrator : MonoBehaviour
                     listWayPoints.Add((waypoints[i]));
                     i += 1;
                 }
-                publisherService.PublishListOfROSPoints(listWayPoints, waypointsDebugRosTopic);
+                publisherService.PublishListOfROSPointsAsPointCloud(listWayPoints, waypointsDebugRosTopic);
             }
             publisherService.PublishDebugPoint(goalDebugPoint, goalDebugRosTopic);
             lastTrajectoryPublish = Time.time;
@@ -452,6 +478,18 @@ public class Orchestrator : MonoBehaviour
             publisherService.PublishEmptyPointCloud(splinedTrajectoryRosTopic);
         }
 
+    }
+
+    void ScanCompletedNavigation()
+    {
+        obstaclesCentroidsSensed = dynamicObstacleService.getROSObstacleCentroids(lidar.ScannedPoints, localizationService.GetTMapLaser(), distanceMapService.getDistanceMapInstance());
+        //Debug.Log($"Sensed and publishing {obstaclesCentroidsSensed.Count} obstacles centroids...");
+        publisherService.PublishListOfObstacleCentroids(obstaclesCentroidsSensed, dynamicObstaclesRosTopic);
+
+        obstacleTrackerService.Update(obstaclesCentroidsSensed, Time.time);
+        publisherService.PublishListOfObstacleCentroids(obstacleTrackerService.GetConfirmedCircles(), trackedObstaclesRosTopic);
+        //foreach (ObstacleTrack t in obstacleTrackerService.GetConfirmedTracks())
+        //    Debug.Log($"track {t.id}: pos=({t.cx:F2},{t.cy:F2}) r={t.r:F2} v=({t.vx:F2},{t.vy:F2}) age={t.age(Time.time):F1}s hits={t.hits}");
     }
 
     void ScanCompletedLetsWork()
