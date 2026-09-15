@@ -21,6 +21,7 @@ public class OccupancyGridService
 
     private float zMin;
     private float zMax;
+    private float bodyRadius;
 
     private Dictionary<(int, int), float> hashMapOnlineoccupancyGrid;
     private (sbyte[], int W, int H, float originX, float originY, float resolution) dataForPublisher;
@@ -33,12 +34,13 @@ public class OccupancyGridService
     private float occBlockThreshold;
     private float elevThrehsold;
 
-    public OccupancyGridService(float resolution, float zMin, float zMax, float probOcc, float probFree, float occBlockThreshold, float elevThrehsold)
+    public OccupancyGridService(float resolution, float zMin, float zMax, float bodyRadius, float probOcc, float probFree, float occBlockThreshold, float elevThrehsold)
     {
         this.resolution = resolution;
         this.hashMapOnlineoccupancyGrid = new Dictionary<(int, int), float>();
         this.zMin = zMin;
         this.zMax = zMax;
+        this.bodyRadius = bodyRadius;
         lOcc = Mathf.Log(probOcc / (1.0f - probOcc));
         lFree = Mathf.Log(probFree / (1.0f - probFree));
         this.occBlockThreshold = occBlockThreshold;
@@ -94,7 +96,7 @@ public class OccupancyGridService
 
             float dxh = vRos.x - tRos.x;
             float dyh = vRos.y - tRos.y;
-            if (dxh * dxh + dyh * dyh < 0.30*0.30) continue;
+            if (dxh * dxh + dyh * dyh < bodyRadius*bodyRadius) continue;
 
             float dh = Mathf.Sqrt(Mathf.Pow((vRos.x - tRos.x),2) + Mathf.Pow((vRos.y - tRos.y),2));   // distanza orizzontale
             float dz = vRos.z - tRos.z;                                                               // dislivello
