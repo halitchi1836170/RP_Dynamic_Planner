@@ -53,6 +53,13 @@ missions, selected by the `calculateAndOverrideOccupancyMapFlag` switch on the `
 
  Wheel encoders ──► Odometry (exact / Runge-Kutta) ──┬──► TF, /odometry
                                                      └──► predict step of scan-to-map localization (ICP + gate)
+
+ LiDAR 3D scan ──► Voxel downsample ──► localized pose ──► "explained by the map?" test on the static EDT
+                                                                          │ (unexplained points)
+                                                                          ▼
+                                                  Grid-hash clustering ──► obstacle circles (cx, cy, r)
+                                                                          ▼
+                                                  Obstacle tracker (association, velocity, persistence)
 ```
 
 ### 1.2 Screenshot — system overview
@@ -386,7 +393,70 @@ A three-stage filter that fuses wheel odometry with LiDAR registration against t
   (selectable between odometry-only, ICP-localized, or ground truth for debugging).
 
 
-### 2.14 Supporting numerical library
+### 2.14 Dynamic obstacle manager — detection and tracking
+
+**Files:** [DynamicObstacleService.cs](Core/ObstaclesManager/DynamicObstacleService.cs),
+[ObstacleTrackerService.cs](Core/ObstaclesManager/ObstacleTrackerService.cs)
+
+In navigation mode the saved map is static, so anything the LiDAR sees that the map does not explain is, by
+definition, a **new obstacle** (a person, a cart, a door that was closed during mapping). The obstacle manager runs
+on every scan (`OnScanComplete`, 10 Hz) and turns the raw cloud into a small list of tracked circles that the
+downstream safety layer (CBF, see §6) and the replanning logic can consume.
+
+**Detection** (`getROSObstacleCentroids`) — a per-scan pipeline designed to be cheap on ~23k points:
+
+1. **Voxel downsampling** first (`voxelSize`), so every later step works on ~1–2k points.
+2. **Re-projection through the localized pose.** Points are brought back to the laser frame and re-projected with
+   `T_map_laser` from the localization filter (§2.13) — *not* with the Unity ground-truth transform — so the
+   detector sees the world exactly as the rest of the stack estimates it. The result is expressed in the 2D ROS map
+   frame, the same frame used by the planner and the controller.
+3. **Geometric filters:** height band `[zMin, zMax]` (as in mapping), self-hit rejection within `bodyRadius` of the
+   laser, and a **maximum detection range** `maxDetectionRange` — far returns are both unreliable and useless for
+   local avoidance.
+4. **"Explained by the map" test on the distance transform.** Instead of comparing against the single occupied
+   cell, each point is looked up in the static EDT: it is *unexplained* when
+
+   ```
+   EDT(p) · resolution  >  tol(d) = obsTol + obsTolPerMeter · d
+   ```
+
+   with `d` the range from the laser. Using the EDT makes the test tolerant to localization error and range noise
+   (a wall seen 5 cm off still has near-zero clearance), and the **range-dependent tolerance** accounts for the
+   fact that a heading error of 1° displaces a point by 1.7 cm per metre of range, on top of the sensor noise and
+   the chamfer overestimate of the 8-connected EDT. Unknown cells (`−1`) are free for the EDT, so returns from
+   never-mapped regions are legitimately flagged.
+5. **Grid-hash Euclidean clustering.** Unexplained points are bucketed in cells of side `clusteringRadius` and
+   connected components over the 8-neighbourhood are extracted by BFS — `O(n)` without a KD-tree. Clusters with
+   fewer than `minClusterPoints` points are discarded as noise; each surviving cluster becomes a bounding circle
+   `(centroid, max distance from centroid + clusterMargin)`.
+
+![Obstacle Manager](Documentation/Images/07_obstacle_manager.png)
+
+*Known sensor limit:* the LiDAR has a ±15° vertical field of view, so an obstacle lower than the laser mount
+disappears when closer than `d_blind ≈ (h_laser − h_obstacle) / tan 15°`. This is physical, not algorithmic, and it
+is exactly the gap the tracker is meant to bridge.
+
+**Tracking** (`ObstacleTrackerService`) — per-scan detections have no identity and flicker; the tracker turns them
+into persistent `ObstacleTrack` objects (`id, cx, cy, r, vx, vy, firstSeen, lastSeen, hits`):
+
+* **Association**: greedy nearest-neighbour between live tracks and detections with a distance gate (`trackGate`),
+  oldest tracks choosing first. Unassigned detections spawn new tracks.
+* **Velocity estimate** by finite differences over the *actual* elapsed time since the last association (so a
+  missed scan does not corrupt it), smoothed with a first-order low-pass (`trackAlphaLowpass`) and zeroed inside a
+  dead-zone (`trackVDeadzone`) so centroid jitter is not mistaken for motion. This is the `ṗ_obs` term the CBF
+  needs for moving obstacles.
+* **Radius with slow decay** `r ← max(r_det, 0.9 r)`: a partial view (obstacle seen from one side) must not
+  collapse the safety circle on a single frame.
+* **Confirmation and forgetting**: a track is exposed to consumers only after `trackMinHits` associations
+  (single-frame noise never reaches the controller) and is dropped after `trackForgetTime` without detections
+  (covers occlusions and the vertical blind cone). Track age is what the replanning trigger will use to decide that
+  an obstacle is *persistent* rather than transient.
+
+Both stages are visualized in RViz as sampled circles on `/debug/dynamic_obstacles` (instantaneous detections) and
+`/debug/tracked_obstacles` (confirmed tracks only); an empty list explicitly clears the display so that the
+visualization reflects the true per-scan state.
+
+### 2.15 Supporting numerical library
 
 **File:** [MatrixVectorUtilities.cs](Core/Math/MatrixVectorUtilities.cs) (~1200 lines, hand-written)
 
@@ -420,6 +490,7 @@ throttled republication rates per topic to avoid saturating the TCP queue.
 | `/splined_path` | `Path` | Final splined geometric trajectory |
 | `/debug/start_pose`, `/debug/waypoints`, `/debug/goal_pose` | `PointCloud2` | Mission definition |
 | `/debug/current_pose`, `/debug/true_pose`, `/debug/localization/icp_pose` | `PointCloud2` | Odometric, ground-truth and localized poses |
+| `/debug/dynamic_obstacles`, `/debug/tracked_obstacles` | `PointCloud2` | Per-scan obstacle detections and confirmed tracks (sampled circles) |
 | `/cmd_vel` *(subscribed)* | `Twist` | External teleoperation input |
 
 ---
@@ -439,6 +510,8 @@ Assets/Scripts/
 │   ├── MotionPlanner/               MotionPlannerService (A*, LOS-PS, splines, velocity profiling)
 │   ├── Controller/                  ControllerService (nonlinear tracking control)
 │   ├── Localization/                LocalizationService (predict / correct / gate)
+│   ├── ObstaclesManager/            DynamicObstacleService (EDT-based detection + clustering),
+│   │                                ObstacleTrackerService (association, velocity, persistence)
 │   └── Math/                        MatrixVectorUtilities, PoseMatrix4x4 (Exp/Log), KDTree,
 │                                    TridiagonalSolver, ICPUtils
 ├── LiDAR3D/                         LiDAR3D sensor simulation + publisher
@@ -473,6 +546,11 @@ control). The most relevant ones:
 | `b` / `zeta` | `10.0` / `0.8` | Nonlinear controller gain parameters |
 | `useICPLocalization` | `true` | Close the control loop on the localized pose instead of raw odometry |
 | `minInlierRatio` / `maxResidual` / `maxLocalizationJump` | `0.6` / `0.25 m` / `0.4 m` | Localization acceptance gates |
+| `obsTol` / `obsTolPerMeter` | `0.2 m` / `0.03 m/m` | "Explained by the map" clearance tolerance at zero range and its growth with range |
+| `maxDetectionRange` / `bodyRadius` | `3.5` / `0.45 m` | Detection range window (far cut-off / self-hit rejection) |
+| `clusteringRadius` / `minClusterPoints` / `clusterMargin` | `0.3 m` / `4` / `0.05 m` | Grid-hash clustering cell, noise threshold, safety margin on the circle radius |
+| `trackGate` / `trackAlphaLowpass` / `trackVDeadzone` | `0.5 m` / `0.3` / `0.05 m/s` | Track association gate, velocity low-pass, velocity dead-zone |
+| `trackMinHits` / `trackForgetTime` | `3` / `1.0 s` | Confirmations needed to expose a track / time without detections before dropping it |
 
 ---
 
@@ -482,18 +560,26 @@ control). The most relevant ones:
 kernels and planar constraint, Graph-SLAM with loop closure and robust Gauss–Newton + CG optimization, occupancy
 grid mapping with persistence, Euclidean distance transform, A* global planning over the EDT cost map, LOS-PS
 smoothing, cubic-spline trajectory generation, forward–backward velocity profiling, nonlinear trajectory tracking,
-and scan-to-map localization.
+scan-to-map localization, and per-scan **dynamic obstacle detection and tracking** (§2.14).
 
-**In progress — the dynamic distance-map planner.** The global planner currently runs **once**, at startup, on the
-static map. The remaining work turns it into the dynamic planner required by the course specification:
+**In progress — from a static to a dynamic planner.** The global planner currently runs **once**, at startup, on
+the static map. The obstacle manager above is the perception front-end of the dynamic behaviour; the remaining
+work closes the loop:
 
-1. Replace the Euclidean A* heuristic with the **exact cost-to-go from a Dijkstra expansion on an empty map**
+1. **Control Barrier Functions (CBF) as a safety filter on the tracking controller.** A small QP (solved with the
+   Goldfarb–Idnani dual method from `Accord.Math`) minimally corrects the nominal control `(v, ω)` subject to:
+   one barrier constraint per tracked obstacle `h = ‖p_b − p_obs‖² − R²` (with the obstacle velocity from the
+   tracker), one barrier from the static EDT `h = EDT(p_b)·res − r_safe`, and a relaxed Lyapunov (CLF) constraint
+   on the tracking error. Constraints are written on the look-ahead point `p_b = p + b[cos θ, sin θ]ᵀ` so that
+   both `v` and `ω` enter with relative degree one.
+2. **Replanning triggers**: an obstacle track persistent on the remaining reference, an excessive deviation from
+   the reference, or a CBF active for too long.
+3. **Replanning pipeline**: paint the persistent tracks into a copy of the static occupancy grid, recompute the
+   EDT, re-run A* → LOS-PS → spline → velocity profile from the current localized pose to the remaining waypoints,
+   and re-arm the controller. Re-starting from the *pristine* map plus the *currently* tracked obstacles is what
+   lets the original path be recovered once an obstacle leaves.
+4. Replace the Euclidean A* heuristic with the **exact cost-to-go from a Dijkstra expansion on an empty map**
    (tighter, still admissible and consistent → fewer expanded nodes).
-2. Build a **local distance map** per scan, in a window around the robot, from the live scan expressed in the
-   global grid through the localized pose.
-3. **Fuse the local map into the global one** with a cell-wise `min` operator, and republish.
-4. **Replanning triggers**: detect when the current trajectory becomes blocked on the updated map and re-run the
-   pipeline (A* → LOS-PS → spline → velocity profile → controller re-arm) from the current localized pose.
 5. Full **ROS navigation-stack integration** (subscribe `/scan`, pose from TF `map → base_link`, standard
    `nav_msgs/Path` output).
 
