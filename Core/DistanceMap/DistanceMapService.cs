@@ -250,7 +250,7 @@ public class DistanceMap
         return returnNeighbors;
     }
 
-    private bool cellInMap((int cellX, int cellY) cell)
+    public bool cellInMap((int cellX, int cellY) cell)
     {
         if (cell.cellX >= 0 && cell.cellX < W && cell.cellY >= 0 && cell.cellY < H) return true;
         return false;
