@@ -554,7 +554,7 @@ public class PublishingService
     // Traiettoria pianificata come nav_msgs/Path. I punti arrivano GIA' in coordinate ROS
     // (frame della griglia, X-Y di "odom"): originX/originY + (col/row)*resolution -> NIENTE UnityToRos.
 
-    public void PublishListOfROSPoints(List<(float x, float y)> listPoints, string topic)
+    public void PublishListOfROSPointsAsPath(List<(float x, float y)> listPoints, string topic)
     {
         if (listPoints == null) return;
 
@@ -579,9 +579,74 @@ public class PublishingService
         ROSConnection.GetOrCreateInstance().Publish(topic, pathMsg);
     }
 
+    public void PublishListOfROSPointsAsPointCloud(List<(float x, float y)> listPoints, string topic)
+    {
+        if (listPoints == null || listPoints.Count == 0) return;
+
+        PointCloud2Msg cloudMsg = new PointCloud2Msg();
+        HeaderMsg header = getPointCloud2MsgHeader();
+        cloudMsg.header = header;
+
+        // Struttura dei campi: 3 coordinate float a 32 bit (4 byte ciascuna)
+        // x (offset 0), y (offset 4), z (offset 8) -> punto totale = 12 byte
+        uint pointStep = 12;
+        uint pointCount = (uint)listPoints.Count;
+
+        cloudMsg.height = 1;              // Nuvola non strutturata (1D array)
+        cloudMsg.width = pointCount;
+        cloudMsg.is_dense = true;
+        cloudMsg.is_bigendian = false;
+        cloudMsg.point_step = pointStep;
+        cloudMsg.row_step = pointStep * pointCount;
+
+        cloudMsg.fields = new PointFieldMsg[]
+        {
+        new PointFieldMsg("x", 0, PointFieldMsg.FLOAT32, 1),
+        new PointFieldMsg("y", 4, PointFieldMsg.FLOAT32, 1),
+        new PointFieldMsg("z", 8, PointFieldMsg.FLOAT32, 1)
+        };
+
+        // Creazione del buffer binario grezzo
+        byte[] rawData = new byte[cloudMsg.row_step];
+
+        for (int i = 0; i < listPoints.Count; i++)
+        {
+            int offset = i * (int)pointStep;
+
+            Buffer.BlockCopy(BitConverter.GetBytes(listPoints[i].x), 0, rawData, offset, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes(listPoints[i].y), 0, rawData, offset + 4, 4);
+            Buffer.BlockCopy(BitConverter.GetBytes(0.0f), 0, rawData, offset + 8, 4); // z fissa a 0.0
+        }
+
+        cloudMsg.data = rawData;
+
+        ROSConnection.GetOrCreateInstance().Publish(topic, cloudMsg);
+    }
+
+    public void PublishListOfObstacleCentroids(List<(float cx, float cy, float r)> centroids, string topic)
+    {
+        if (centroids == null || centroids.Count == 0)
+        {
+            PublishEmptyPointCloud(topic);   // altrimenti RViz tiene l'ultimo cerchio e la detection sembra continua
+            return;
+        }
+
+        List<(float x, float y)> allPoints = new List<(float x, float y)>();
+        foreach((float cx, float cy, float r) c in centroids)
+        {
+            int Ndeltadeg = 20;
+            float deltaRad = 2f * (float)Math.PI / Ndeltadeg;   // giro COMPLETO: con PI/N si disegnava solo mezzo cerchio
+            for(int i = 0; i <= Ndeltadeg; i++)                  // <= : ripete il primo punto e chiude il poligono in RViz
+            {
+                allPoints.Add((c.cx+c.r*Mathf.Cos(deltaRad*i), c.cy + c.r * Mathf.Sin(deltaRad * i)));
+            }
+        }
+        PublishListOfROSPointsAsPointCloud(allPoints, topic);
+    }
+
     public void PublishPlannedTrajectory(List<(float x, float y)> pathWorld, string topic)
     {
-        PublishListOfROSPoints(pathWorld, topic);
+        PublishListOfROSPointsAsPath(pathWorld, topic);
     }
 
     // Pubblica un singolo punto (debug) come PointCloud2. Il punto è GIA' in coordinate ROS
@@ -617,6 +682,6 @@ public class PublishingService
 
     internal void PublishLSplinedGeometricTrajectory(List<(float, float)> list, string topic)
     {
-        PublishListOfROSPoints(list, topic);
+        PublishListOfROSPointsAsPath(list, topic);
     }
 }
