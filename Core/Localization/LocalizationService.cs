@@ -100,4 +100,6 @@ public class LocalizationService
     }
 
     public (float x, float y, float theta) GetRosPose() => toRosPose(T_map_laser);
+
+    public float[,] GetTMapLaser() => T_map_laser;
 }
