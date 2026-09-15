@@ -7,10 +7,10 @@ public class LiDAR3D : MonoBehaviour
 {
     //LiDAR3D hardware parameters
     public int channels = 32;
-    public float vAngleMin = -15.0f;
-    public float vAngleMax = 15.0f;
+    public float vAngleMin = -25.0f;
+    public float vAngleMax = 25.0f;
     public int pointsPerChannel = 720;
-    public float maxRange = 25.0f;
+    public float maxRange = 35.0f;
     public float scanFrequenzy = 10.0f; //Hz
     public bool displayLaserScan = false;
 
