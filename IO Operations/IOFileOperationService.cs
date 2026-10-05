@@ -1,3 +1,4 @@
+﻿using System;
 using System.IO;
 using System.Text;
 using System.Globalization;
@@ -13,6 +14,7 @@ public class IOFileOperationService
 {
     private readonly string pgmPath;
     private readonly string yamlPath;
+    private string runDirectory;
 
     private const byte UNKNOWN_PIXEL = 205;
 
@@ -21,6 +23,44 @@ public class IOFileOperationService
         string dir = Application.persistentDataPath;
         pgmPath = Path.Combine(dir, baseFileNameWithoutExt + ".pgm");
         yamlPath = Path.Combine(dir, baseFileNameWithoutExt + ".yaml");
+    }
+
+    // Cartella dedicata al run corrente: <persistentDataPath>/plots/run_<timestamp>/
+    public string GetRunDirectory()
+    {
+        if (runDirectory == null)
+        {
+            runDirectory = Path.Combine(Application.persistentDataPath, "plots", "run_" + DateTime.Now.ToString("yyyyMMdd_HHmmss"));
+            Directory.CreateDirectory(runDirectory);
+        }
+        return runDirectory;
+    }
+
+    public void WriteCsv(string fileName, string header, List<string> rows)
+    {
+        string path = Path.Combine(GetRunDirectory(), fileName);
+        using (StreamWriter writer = new StreamWriter(path, false))
+        {
+            writer.WriteLine(header);
+            foreach (string row in rows) writer.WriteLine(row);
+        }
+        Debug.Log($"CSV scritto ({rows.Count} righe): {path}");
+    }
+
+    // EDT grezza per i grafici: header (W,H,originX,originY,resolution) + W*H float in METRI, little-endian.
+    public void WriteDistanceMapBinary(float[] distanceMap, int W, int H, float originX, float originY, float resolution)
+    {
+        string path = Path.Combine(GetRunDirectory(), "distancemap.bin");
+        using (BinaryWriter writer = new BinaryWriter(File.Open(path, FileMode.Create)))
+        {
+            writer.Write(W);
+            writer.Write(H);
+            writer.Write(originX);
+            writer.Write(originY);
+            writer.Write(resolution);
+            for (int i = 0; i < W * H; i++) writer.Write(distanceMap[i] * resolution);
+        }
+        Debug.Log($"Distance map scritta ({W}x{H}): {path}");
     }
 
     public string GetPgmPath() => pgmPath;

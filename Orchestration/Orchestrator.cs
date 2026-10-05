@@ -1,4 +1,4 @@
-using RosMessageTypes.Nav;
+﻿using RosMessageTypes.Nav;
 using RosMessageTypes.Sensor;
 using RosMessageTypes.Tf2;
 using System;
@@ -149,6 +149,31 @@ public class Orchestrator : MonoBehaviour
     private (float x, float y, float theta) icpLocalizedConfig;
     public int maxIterationLocalization = 7;
 
+    public string PLOTTINGFIELDS = "FOLLOWING PLOTTING FIELDS";
+    public bool recordPlotData = true;
+    public float plotSamplePeriod = 0.05f;   // campionamento delle pose per i grafici
+    private bool plotDataDumped = false;
+
+    public string CBFFIELDS = "FOLLOWING CBF SAFETY FILTER FIELDS";
+    public bool cbfEnabled = true;
+    public float bLookAhead = 0.15f;          // punto avanzato: da autorita di sterzata al QP
+    public float rSafeDynamic = 0.35f;        // >= raggio robot + bLookAhead
+    public float rSafeStatic = 0.18f;         // < epsilonTunnelLoSPS, altrimenti litiga col percorso nominale
+    public float alphaDynamic = 1.5f;
+    public float alphaStatic = 1.5f;
+    public float gammaCLF = 0.5f;
+    public float slackPenalty = 100f;
+    public float vDeviationWeight = 1.0f;     // costo di deviare dalla v nominale
+    public float wDeviationWeight = 0.2f;     // < vDeviationWeight -> il QP sterza invece di frenare
+    public float staticActivationDistance = 0.6f;
+    public float obstacleActivationRange = 3.0f;
+    public float gradientStepCells = 2f;
+    public float cbfActivationTolerance = 1e-3f;
+    public float referenceMaxLag = 0.20f;     // il riferimento aspetta solo oltre questo scarto [m]
+    public float wMaxCBF = 1.5f;              // limite di omega DEL QP: molto sotto wMaxClamp, altrimenti strattona
+    public float maxLinearAccelCommand = 1.0f;    // slew rate del comando v [m/s^2]
+    public float maxAngularAccelCommand = 3.0f;   // slew rate del comando omega [rad/s^2]
+
     public string OBSTACLESMANAGERFILEDS = "FOLLOWING DYNAMIC OBSTACLES MANAGER FIELDS";
     private List<(float cx, float cy, float r)> obstaclesCentroidsSensed;
     public float obsTol = 0.2f;             // tolleranza "spiegato dalla mappa" a range 0 [m]: tol(d) = obsTol + obsTolPerMeter*d
@@ -157,6 +182,7 @@ public class Orchestrator : MonoBehaviour
     public float clusteringRadius = 0.3f;
     public int minClusterPoints = 4;       // sotto = rumore (punti gia' downsampled a voxelSize)
     public float clusterMargin = 0.05f;    // margine sul raggio del cerchio di ingombro [m]
+    public float maxUnexplainedFraction = 0.5f;   // oltre: scansione scartata (posa sospetta)
     public float trackGate = 0.5f;          // associazione detection-track: distanza max [m]
     public float trackAlphaLowpass = 0.3f;  // filtro sulla velocita' stimata
     public float trackVDeadzone = 0.05f;    // sotto: velocita' = 0 (jitter del centroide) [m/s]
@@ -194,6 +220,8 @@ public class Orchestrator : MonoBehaviour
     private LocalizationService localizationService;
     private DynamicObstacleService dynamicObstacleService;
     private ObstacleTrackerService obstacleTrackerService;
+    private CBFService cbfService;
+    private PlotDataService plotDataService;
 
     //--------------------------------------------------------------------------------------------------------------------------------------------------------
     //                                                                       ROBOT STATE
@@ -237,9 +265,11 @@ public class Orchestrator : MonoBehaviour
         ioService = new IOFileOperationService(occupancyGridMapFileName);
         distanceMapService = new DistanceMapService(obstacleThreshold, k, eps);
         motionPlannerService = new MotionPlannerService(smoothTrajWithLoSPS, epsilonTunnelLoSPS, linearMeanVelocity, qiCouple, qfCouple, subSamplesPerSpline, secondsControlFrequency, wMax, aMax, vMax);
-        controllerService = new ControllerService(secondsControlFrequency, controlStrategy, (leftWheel, rightWheel), wheelRadius, wheelSeparation, b, zeta, vMax, wMaxClamp);
+        plotDataService = new PlotDataService(plotSamplePeriod);
+        cbfService = new CBFService(bLookAhead, rSafeDynamic, rSafeStatic, alphaDynamic, alphaStatic, gammaCLF, slackPenalty, vDeviationWeight, wDeviationWeight, staticActivationDistance, obstacleActivationRange, gradientStepCells, cbfActivationTolerance, wMaxCBF);
+        controllerService = new ControllerService(secondsControlFrequency, controlStrategy, (leftWheel, rightWheel), wheelRadius, wheelSeparation, b, zeta, vMax, wMaxClamp, referenceMaxLag, maxLinearAccelCommand, maxAngularAccelCommand, cbfEnabled, cbfService);
         localizationService = new LocalizationService(icpService, marrtionLaserLinkTransform, minInlierRatio, maxResidual, maxLocalizationJump);
-        dynamicObstacleService = new DynamicObstacleService(voxelSize, marrtionLaserLinkTransform, zMin, zMax, bodyRadius, obsTol, obsTolPerMeter, maxDetectionRange, clusteringRadius, minClusterPoints, clusterMargin);
+        dynamicObstacleService = new DynamicObstacleService(voxelSize, marrtionLaserLinkTransform, zMin, zMax, bodyRadius, obsTol, obsTolPerMeter, maxDetectionRange, clusteringRadius, minClusterPoints, clusterMargin, maxUnexplainedFraction);
         obstacleTrackerService = new ObstacleTrackerService(trackGate, trackAlphaLowpass, trackVDeadzone, trackMinHits, trackForgetTime);
 
 
@@ -294,6 +324,7 @@ public class Orchestrator : MonoBehaviour
             occupancyGridCachedReady = true;
             distanceMapService.SetOccupancyGridMap(occGrid);
             distanceMapService.calculateDistanceMap();
+            cbfService.SetDistanceMap(distanceMapService.getDistanceMapInstance());
             publisherService.PublishDistanceMap(distanceMapService.getDistanceMapForPublisher(), distanceMapRosTopic);
             distanceMapComputed = true;
 
@@ -311,6 +342,7 @@ public class Orchestrator : MonoBehaviour
             if(motionPlannerService.GeometricTrajectoryDetermined() && boolControlMarrtino)
             {
                 controllerService.Arm(motionPlannerService.getGeometricTrajectoryForController());
+                if (recordPlotData) plotDataService.RecordPlan(Time.time, motionPlannerService.getGeometricTrajectoryForController());
                 if (differentialDriveController != null) differentialDriveController.autonomousControlActive = true;   // la tastiera si fa da parte
                 //controllerService.FollowTrajectory(motionPlannerService.getGeometricTrajectoryForController());
             }
@@ -358,6 +390,19 @@ public class Orchestrator : MonoBehaviour
             }
             publisherService.PublishDebugPoint(goalDebugPoint, goalDebugRosTopic);
             lastTrajectoryPublish = Time.time;
+        }
+
+        if (recordPlotData && plotDataService.isTimeToSamplePose())
+        {
+            (float trx, float trty, float trz) gtPose = UnityToRosPosition(marrtionLaserLinkTransform.position.x, marrtionLaserLinkTransform.position.y, marrtionLaserLinkTransform.position.z);
+            float gtThetaPose = Mathf.Atan2(-marrtionLaserLinkTransform.forward.x, marrtionLaserLinkTransform.forward.z);
+            (float xo, float yo, float tho) = odometryService.getUpdatedConfiguration();
+            plotDataService.RecordPose(Time.time, (gtPose.trx, gtPose.trty, gtThetaPose), icpLocalizedConfig, (xo, -yo, -tho));
+        }
+
+        if (recordPlotData && !plotDataDumped && trajectoryPlanned && boolControlMarrtino && !controllerService.isControllerActive())
+        {
+            DumpPlotData();
         }
 
         if (odometryService.isTimeToLocalize())
@@ -416,6 +461,11 @@ public class Orchestrator : MonoBehaviour
 
             (double v, double w) feedbackControl = controllerService.ControlStep(currentConfigRos);
 
+            if (recordPlotData)
+            {
+                plotDataService.RecordControl(Time.time, feedbackControl, controllerService.getLastNominalControl(), controllerService.isCBFActive(), controllerService.isLastCBFFeasible(), cbfService.getLastDiagnostics(), controllerService.getLastTrackingTerms());
+            }
+
             if (flipControlOmega) feedbackControl.w = -feedbackControl.w;
             controllerService.applyToWheels(feedbackControl);
         }
@@ -460,6 +510,46 @@ public class Orchestrator : MonoBehaviour
         return waypoints;
     }
 
+    void DumpPlotData()
+    {
+        plotDataDumped = true;
+        ioService.WriteCsv("control.csv", PlotDataService.CONTROL_HEADER, plotDataService.getControlRows());
+        ioService.WriteCsv("poses.csv", PlotDataService.POSE_HEADER, plotDataService.getPoseRows());
+        ioService.WriteCsv("plans.csv", PlotDataService.PLAN_HEADER, plotDataService.getPlanRows());
+        ioService.WriteCsv("obstacles.csv", PlotDataService.OBSTACLE_HEADER, plotDataService.getObstacleRows());
+        ioService.WriteCsv("limits.csv", "name,value", getPlotLimits());
+        if (distanceMapComputed)
+        {
+            (int W, int H, float originX, float originY, float resolution) meta = distanceMapService.getDistanceMapMetadata();
+            ioService.WriteDistanceMapBinary(distanceMapService.getDistanceMap(), meta.W, meta.H, meta.originX, meta.originY, meta.resolution);
+        }
+        Debug.Log($"Dati per i grafici in: {ioService.GetRunDirectory()}");
+    }
+
+    private List<string> getPlotLimits()
+    
+    {
+        System.Globalization.CultureInfo inv = System.Globalization.CultureInfo.InvariantCulture;
+        return new List<string>() {
+            "vMax," + vMax.ToString(inv),
+            "linearMeanVelocity," + linearMeanVelocity.ToString(inv),
+            "wMax," + wMax.ToString(inv),
+            "wMaxClamp," + wMaxClamp.ToString(inv),
+            "wMaxCBF," + wMaxCBF.ToString(inv),
+            "aMax," + aMax.ToString(inv),
+            "maxLinearAccelCommand," + maxLinearAccelCommand.ToString(inv),
+            "maxAngularAccelCommand," + maxAngularAccelCommand.ToString(inv),
+            "rSafeStatic," + rSafeStatic.ToString(inv),
+            "rSafeDynamic," + rSafeDynamic.ToString(inv),
+            "bLookAhead," + bLookAhead.ToString(inv),
+        };
+    }
+
+    void OnApplicationQuit()
+    {
+        if (recordPlotData && !plotDataDumped) DumpPlotData();
+    }
+
     void ClearVisualizationTopics()
     {
         publisherService.PublishEmptyPointCloud(graphSlamNodesTopic);
@@ -488,6 +578,8 @@ public class Orchestrator : MonoBehaviour
 
         obstacleTrackerService.Update(obstaclesCentroidsSensed, Time.time);
         publisherService.PublishListOfObstacleCentroids(obstacleTrackerService.GetConfirmedCircles(), trackedObstaclesRosTopic);
+        cbfService.SetObstacles(obstacleTrackerService.GetConfirmedCirclesWithVelocity());
+        if (recordPlotData) plotDataService.RecordObstacles(Time.time, obstacleTrackerService.GetConfirmedTracks());
         //foreach (ObstacleTrack t in obstacleTrackerService.GetConfirmedTracks())
         //    Debug.Log($"track {t.id}: pos=({t.cx:F2},{t.cy:F2}) r={t.r:F2} v=({t.vx:F2},{t.vy:F2}) age={t.age(Time.time):F1}s hits={t.hits}");
     }
