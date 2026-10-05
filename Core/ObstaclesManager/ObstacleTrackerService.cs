@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using UnityEngine;
 
 public class ObstacleTrack
@@ -128,6 +128,16 @@ public class ObstacleTrackerService
     public List<ObstacleTrack> GetAllTracks()
     {
         return tracks;
+    }
+
+    public List<(float cx, float cy, float r, float vx, float vy)> GetConfirmedCirclesWithVelocity()
+    {
+        List<(float cx, float cy, float r, float vx, float vy)> circles = new List<(float, float, float, float, float)>();
+        foreach (ObstacleTrack t in GetConfirmedTracks())
+        {
+            circles.Add((t.cx, t.cy, t.r, t.vx, t.vy));
+        }
+        return circles;
     }
 
     public List<(float cx, float cy, float r)> GetConfirmedCircles()
