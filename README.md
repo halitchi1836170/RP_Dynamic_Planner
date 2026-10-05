@@ -49,6 +49,10 @@ missions, selected by the `calculateAndOverrideOccupancyMapFlag` switch on the `
                                                  ▼
                                     Nonlinear trajectory-tracking controller
                                                  ▼
+                                    CBF safety filter (QP: barriers + CLF) ◄── tracked obstacles + EDT
+                                                 ▼
+                                    Command slew-rate limit
+                                                 ▼
                                     Differential-drive inverse kinematics ──► wheel drives
 
  Wheel encoders ──► Odometry (exact / Runge-Kutta) ──┬──► TF, /odometry
@@ -60,6 +64,8 @@ missions, selected by the `calculateAndOverrideOccupancyMapFlag` switch on the `
                                                   Grid-hash clustering ──► obstacle circles (cx, cy, r)
                                                                           ▼
                                                   Obstacle tracker (association, velocity, persistence)
+                                                                          │
+                                                                          └──► CBF safety filter (above)
 ```
 
 ### 1.2 Screenshot — system overview
@@ -456,7 +462,117 @@ Both stages are visualized in RViz as sampled circles on `/debug/dynamic_obstacl
 `/debug/tracked_obstacles` (confirmed tracks only); an empty list explicitly clears the display so that the
 visualization reflects the true per-scan state.
 
-### 2.15 Supporting numerical library
+### 2.15 Safety filter — Control Barrier Functions as a QP
+
+**Files:** [CBFService.cs](Core/Controller/CBFService.cs), [ControllerService.cs](Core/Controller/ControllerService.cs)
+
+The tracking controller of §2.12 follows the pre-computed trajectory but knows nothing about obstacles that were
+not on the map when the path was planned. Rather than replacing it, a **safety filter** sits between the
+controller and the wheels: at every control step it takes the nominal command `u_nom = (v, ω)` and returns the
+**closest admissible command**, where admissibility is expressed as linear inequalities derived from Control
+Barrier Functions. If nothing is in the way the filter is the identity; it acts only when safety requires it.
+
+**Relative degree and the look-ahead point.** For the unicycle, a barrier written on the body centre
+`h = ‖p − p_obs‖² − R²` has derivative `ḣ = 2(p − p_obs)ᵀ[cos θ, sin θ]ᵀ v`, which does **not contain `ω`**: the
+filter could only brake, never steer around. The constraints are therefore written on the look-ahead point
+
+```
+p_b = p + b_la [cos θ, sin θ]ᵀ        ṗ_b = G(θ) u,     G(θ) = [ cos θ   −b_la sin θ ]
+                                                               [ sin θ    b_la cos θ ]
+```
+
+whose Jacobian with respect to `θ` is non-zero, so both `v` and `ω` enter every constraint with relative degree
+one and `G(θ)` is invertible for `b_la > 0`. The price is that the barrier protects `p_b` while the body is at
+`p`: since the clearance field is 1-Lipschitz, the guarantee on the body is `r_safe − b_la`.
+
+**The three constraint families**, all in the form `a_v v + a_ω ω ≥ rhs`:
+
+* **Dynamic obstacles** (one row per confirmed track within an activation range):
+  `h = ‖p_b − p_o‖² − R²` with `R = r_track + r_safe`, and
+  `ḣ = 2(p_b − p_o)ᵀ G(θ) u − 2(p_b − p_o)ᵀ ṗ_o ≥ −α h`. The second term uses the obstacle velocity estimated by
+  the tracker (§2.14), so a receding obstacle relaxes the constraint and an approaching one tightens it.
+* **Static map**: `h = d(p_b) − r_safe`, with `d` read from the EDT (§2.7) and `∇d` by central differences over a
+  two-cell stencil — one cell is too noisy on the chamfer staircase, and `‖∇d‖ ≈ 1` (eikonal property) is a
+  convenient sanity check. The row is added only close to walls: on the ridges of the field `d` is not
+  differentiable, and there the constraint is both useless and ill-conditioned. `r_safe` is kept **below** the
+  LOS-PS tunnel half-width `epsilonTunnelLoSPS`, otherwise the barrier would be violated along the nominal path
+  itself and the filter would fight the planner in every corridor.
+* **Lyapunov (CLF), relaxed.** Using `V = k₂/2 (e₁² + e₂²) + e₃²/2` — which is the Lyapunov function of the
+  controller already implemented, since substituting the nominal law gives exactly `V̇ = −k₁k₂e₁² − k₃e₃²` — the
+  contraction along the dynamics collapses to `∇Vᵀ q̇ = −k₂ e₁ v − e₃ ω`, and adding the feed-forward term of the
+  moving reference `a₀ = k₂ v_d (e₁ cos e₃ + e₂ sin e₃) + e₃ ω_d` gives `V̇ = a₀ − k₂ e₁ v − e₃ ω ≤ −γV + δ`.
+  The slack `δ` enters with coefficient `+1` and is penalised in the cost, so the CLF row can always be satisfied
+  and **can never make the problem infeasible**: safety is hard, convergence is soft.
+
+A detail that matters in practice: the right-hand side of the CLF row is the *less demanding* of the classical
+`γV + a₀` and the decay the nominal controller already delivers. Without that, plain `V̇ ≤ −γV` asks for more
+contraction than the nominal law provides (its `V̇` has no `e₂` term), and the filter would perturb the command
+even with no obstacles in sight. With it, the solution is **exactly `u_nom`** whenever the barriers are inactive.
+
+**The QP.** Variables `x = (v, ω, δ)`, solved with the Goldfarb–Idnani dual method from `Accord.Math`
+(`min ½xᵀQx + dᵀx` subject to `Ax ≥ b`):
+
+```
+min  ½ w_v (v − v_nom)² + ½ w_ω (ω − ω_nom)² + ½ p δ²
+s.t. box limits on v and ω (ω bounded by its own wMaxCBF, well below the controller clamp)
+     δ ≥ 0
+     one CLF row,  one static row,  one row per nearby tracked obstacle
+```
+
+`w_ω < w_v` makes steering cheaper than braking, so the filter prefers to go around rather than stop. If the
+problem is infeasible — two obstacles forming a gate narrower than `2R`, for instance — the command falls back to
+zero and the event is logged; that situation is precisely what the replanning layer is meant to resolve.
+
+**Two safeguards outside the QP.** The solution of a QP is discontinuous when the active set changes, and a
+discontinuous `ω` is enough to break the scan-to-map ICP: the command is therefore **slew-rate limited**
+(`maxLinearAccelCommand`, `maxAngularAccelCommand`), with limits far looser than the trajectory's own `aMax`, so
+that normal control and emergency braking are untouched and only genuine jumps get clipped. Independently, the
+reference index advances only while the robot keeps up with it (`referenceMaxLag`), which stops the reference
+from running away during an avoidance manoeuvre without ever freezing it permanently.
+
+### 2.16 Run analysis — data logging and plotting
+
+**Files:** [PlotDataService.cs](Core/Plotting/PlotDataService.cs),
+[IOFileOperationService.cs](IO%20Operations/IOFileOperationService.cs), [plot_run.py](../../../../tools/plot_run.py)
+
+Recording and rendering are deliberately separated: Unity writes plain CSV (plus the raw EDT as a binary blob)
+into `persistentDataPath/plots/run_<timestamp>/`, and a standalone matplotlib script renders the figure. This
+avoids pulling a plotting library with `System.Drawing` dependencies into Unity and keeps the logs reusable.
+Four series are recorded — control (commanded and nominal `v`/`ω`, filter flags, barrier margins, tracking
+errors), poses (ground truth / ICP / odometry), plans (one block per controller `Arm`, so replans stay separate)
+and obstacles (one row per confirmed track per scan). The dump happens automatically when the trajectory ends and
+on application quit.
+
+![CBF run analysis](Documentation/Images/08_cbf_run_analysis.png)
+
+The figure above is a real 70 s run with four obstacles that were not in the map. Reading it:
+
+* **Left column.** Linear velocity and acceleration; angular velocity against its three different ceilings
+  (`wMaxCBF` is the QP box, `wMax` the curvature cap used when building the velocity profile, `wMaxClamp` the
+  nominal controller clamp); and the **barrier margins in metres** — `dist − R` for the dynamic obstacles and
+  `d(p_b) − r_safe` for the static map — with the filter effort `‖u − u_nom‖` on the right axis. Orange bands
+  mark the steps where the filter altered the command.
+* **Right column.** A top-down view whose background is the barrier field
+  `h(x,y) = min(static clearance, dynamic clearance)`, with the **`h = 0` contour in dark red**: the boundary of
+  the safe set the robot had to stay inside. Over it, the desired path, the three pose estimates, and each
+  obstacle with its mean radius, the ±σ ring on the radius and error bars on the centroid. Below, the deviation
+  from the active plan and the state-estimation errors.
+
+What the run shows, in numbers: the filter was active on **25 % of the control steps**, the QP was **never
+infeasible**, the deviation from the planned path stayed at **0.09 m on average and 0.31 m at worst**, and ICP
+localization held to **0.07 m mean error** while raw wheel odometry drifted by **3.3 m** — the barrier field makes
+it obvious that the odometry estimate ends up well inside the forbidden region while the localized one does not.
+
+Two honest observations the plot also makes visible, both of which motivate the next section. First, the dynamic
+margin dips slightly **below zero for 14 of 336 steps** (minimum −0.21 m), almost all at the instant a track is
+confirmed: a CBF can only keep you inside a set you are already in, so when an obstacle is first *detected*
+closer than `R`, the filter can merely drive `h` back up (`ḣ ≥ −αh > 0` when `h < 0`), not undo the incursion.
+Shortening the confirmation delay or enlarging `r_safe` trades this against false positives. Second, and more
+importantly, in 70 s the robot covered **5 m of a 25 m plan**: with persistent obstacles the filter keeps it safe
+but pinned, the margin hovering around zero and progress nearly stalled. **Safety without replanning is not
+enough** — which is exactly the gap the next step closes.
+
+### 2.17 Supporting numerical library
 
 **File:** [MatrixVectorUtilities.cs](Core/Math/MatrixVectorUtilities.cs) (~1200 lines, hand-written)
 
@@ -508,10 +624,12 @@ Assets/Scripts/
 │   ├── Occupancy Grid/              OccupancyGridService (log-odds + Bresenham)
 │   ├── DistanceMap/                 DistanceMapService (brushfire EDT), SimplePriorityQueue (binary heap)
 │   ├── MotionPlanner/               MotionPlannerService (A*, LOS-PS, splines, velocity profiling)
-│   ├── Controller/                  ControllerService (nonlinear tracking control)
+│   ├── Controller/                  ControllerService (nonlinear tracking control + safety filter hook),
+│   │                                CBFService (CBF/CLF quadratic program, Goldfarb-Idnani)
 │   ├── Localization/                LocalizationService (predict / correct / gate)
 │   ├── ObstaclesManager/            DynamicObstacleService (EDT-based detection + clustering),
 │   │                                ObstacleTrackerService (association, velocity, persistence)
+│   ├── Plotting/                    PlotDataService (time-series logging for the run analysis)
 │   └── Math/                        MatrixVectorUtilities, PoseMatrix4x4 (Exp/Log), KDTree,
 │                                    TridiagonalSolver, ICPUtils
 ├── LiDAR3D/                         LiDAR3D sensor simulation + publisher
@@ -521,6 +639,9 @@ Assets/Scripts/
 ├── Publishers/                      PublishingService (all ROS message construction)
 ├── IO Operations/                   IOFileOperationService (PGM/YAML/BIN persistence)
 └── KDTree/                          KD-tree debug visualization
+
+tools/
+└── plot_run.py                      Renders the run-analysis figure from the exported CSV
 ```
 
 ---
@@ -551,6 +672,16 @@ control). The most relevant ones:
 | `clusteringRadius` / `minClusterPoints` / `clusterMargin` | `0.3 m` / `4` / `0.05 m` | Grid-hash clustering cell, noise threshold, safety margin on the circle radius |
 | `trackGate` / `trackAlphaLowpass` / `trackVDeadzone` | `0.5 m` / `0.3` / `0.05 m/s` | Track association gate, velocity low-pass, velocity dead-zone |
 | `trackMinHits` / `trackForgetTime` | `3` / `1.0 s` | Confirmations needed to expose a track / time without detections before dropping it |
+| `cbfEnabled` | `true` | Enables the CBF safety filter between the controller and the wheels |
+| `bLookAhead` | `0.15 m` | Look-ahead distance of the barrier point; scales the steering authority of the filter |
+| `rSafeDynamic` / `rSafeStatic` | `0.30` / `0.18 m` | Safety radii added to the tracked obstacle radius / to the static clearance |
+| `alphaDynamic` / `alphaStatic` | `1.5` / `1.5` | Class-K gains of the barriers; higher = less conservative |
+| `gammaCLF` / `slackPenalty` | `0.5` / `100` | Lyapunov contraction rate and penalty on its slack variable |
+| `vDeviationWeight` / `wDeviationWeight` | `1.0` / `0.2` | Cost of deviating from the nominal `v` / `ω`; lower `w` makes the filter steer rather than brake |
+| `wMaxCBF` | `1.5 rad/s` | Angular-velocity box **of the QP**, deliberately well below `wMaxClamp` |
+| `maxLinearAccelCommand` / `maxAngularAccelCommand` | `1.0 m/s²` / `3.0 rad/s²` | Slew-rate limits on the issued command |
+| `referenceMaxLag` | `0.20 m` | The reference index stops advancing beyond this tracking lag |
+| `recordPlotData` / `plotSamplePeriod` | `true` / `0.05 s` | Run logging for the analysis figure |
 
 ---
 
@@ -560,24 +691,25 @@ control). The most relevant ones:
 kernels and planar constraint, Graph-SLAM with loop closure and robust Gauss–Newton + CG optimization, occupancy
 grid mapping with persistence, Euclidean distance transform, A* global planning over the EDT cost map, LOS-PS
 smoothing, cubic-spline trajectory generation, forward–backward velocity profiling, nonlinear trajectory tracking,
-scan-to-map localization, and per-scan **dynamic obstacle detection and tracking** (§2.14).
+scan-to-map localization, per-scan **dynamic obstacle detection and tracking** (§2.14), the **CBF safety filter**
+(§2.15) and the **run-analysis tooling** (§2.16).
 
-**In progress — from a static to a dynamic planner.** The global planner currently runs **once**, at startup, on
-the static map. The obstacle manager above is the perception front-end of the dynamic behaviour; the remaining
-work closes the loop:
+**Remaining — closing the dynamic loop.** Perception and reactive safety are in place, but the global planner
+still runs **once**, at startup, on the static map: when an obstacle is persistent the filter keeps the robot
+safe and the robot stops making progress (§2.16). The missing piece is re-planning:
 
-1. **Control Barrier Functions (CBF) as a safety filter on the tracking controller.** A small QP (solved with the
-   Goldfarb–Idnani dual method from `Accord.Math`) minimally corrects the nominal control `(v, ω)` subject to:
-   one barrier constraint per tracked obstacle `h = ‖p_b − p_obs‖² − R²` (with the obstacle velocity from the
-   tracker), one barrier from the static EDT `h = EDT(p_b)·res − r_safe`, and a relaxed Lyapunov (CLF) constraint
-   on the tracking error. Constraints are written on the look-ahead point `p_b = p + b[cos θ, sin θ]ᵀ` so that
-   both `v` and `ω` enter with relative degree one.
-2. **Replanning triggers**: an obstacle track persistent on the remaining reference, an excessive deviation from
-   the reference, or a CBF active for too long.
-3. **Replanning pipeline**: paint the persistent tracks into a copy of the static occupancy grid, recompute the
-   EDT, re-run A* → LOS-PS → spline → velocity profile from the current localized pose to the remaining waypoints,
-   and re-arm the controller. Re-starting from the *pristine* map plus the *currently* tracked obstacles is what
-   lets the original path be recovered once an obstacle leaves.
+1. **Replanning trigger.** Decide when reactive avoidance is no longer enough: a confirmed track that has been
+   persistent for longer than a dwell time *and* intersects the remaining reference, a deviation from the active
+   plan beyond a threshold, or the safety filter active continuously for too long. A cooldown prevents
+   oscillation between consecutive replans.
+2. **Replanning pipeline.** Stop the controller, paint the persistent tracks as occupied discs into a **copy** of
+   the pristine occupancy grid, recompute the EDT, re-run A* → LOS-PS → spline → velocity profile from the
+   current localized pose through the remaining waypoints, and re-arm the controller. Starting from the pristine
+   map plus only the *currently* tracked obstacles is what lets the original short path be recovered once an
+   obstacle leaves — the cell-wise `min` fusion suggested by the course notes can only add obstacles, never
+   remove them.
+3. **Failure handling.** What to do when no path exists at all (obstacle fully blocking a corridor): hold
+   position, retry periodically, and report the condition.
 4. Replace the Euclidean A* heuristic with the **exact cost-to-go from a Dijkstra expansion on an empty map**
    (tighter, still admissible and consistent → fewer expanded nodes).
 5. Full **ROS navigation-stack integration** (subscribe `/scan`, pose from TF `map → base_link`, standard
