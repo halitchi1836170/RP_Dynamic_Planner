@@ -1,4 +1,4 @@
-using NUnit.Framework;
+﻿using NUnit.Framework;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Diagnostics;
@@ -20,10 +20,11 @@ public class DynamicObstacleService
     private float maxDetectionRange;// oltre questo range i punti sono ignorati (falsi positivi lontani, zone mai mappate)
     private float clusteringRadius;
     private int minClusterPoints;   // cluster con meno punti = rumore (dopo il voxel a voxelSize)
-    private float clusterMargin;    // margine aggiunto al raggio del cerchio di ingombro
+    private float clusterMargin;             // margine aggiunto al raggio del cerchio di ingombro
+    private float maxUnexplainedFraction;    // oltre questa frazione di punti non spiegati la scansione e scartata
 
 
-    public DynamicObstacleService(float voxelSize, Transform marrtionLaserLinkTransform, float zMin, float zMax, float bodyRadius, float obsTol, float obsTolPerMeter, float maxDetectionRange, float clusteringRadius, int minClusterPoints, float clusterMargin)
+    public DynamicObstacleService(float voxelSize, Transform marrtionLaserLinkTransform, float zMin, float zMax, float bodyRadius, float obsTol, float obsTolPerMeter, float maxDetectionRange, float clusteringRadius, int minClusterPoints, float clusterMargin, float maxUnexplainedFraction)
     {
         this.voxelSize = voxelSize;
         this.laserTransform = marrtionLaserLinkTransform;
@@ -36,6 +37,7 @@ public class DynamicObstacleService
         this.clusteringRadius = clusteringRadius;
         this.minClusterPoints = minClusterPoints;
         this.clusterMargin = clusterMargin;
+        this.maxUnexplainedFraction = maxUnexplainedFraction;
     }
 
     public List<(float cx, float cy, float r)> getROSObstacleCentroids(List<Vector3> scannedPoints, float[,] T_Map_laser, DistanceMap distanceMap)
@@ -82,6 +84,14 @@ public class DynamicObstacleService
             {
                 unexplained.Add(p2);
             }
+        }
+
+        // se quasi tutta la scansione risulta non spiegata la mappa non e cambiata: e la posa ad essere
+        // sbagliata. Meglio nessun ostacolo che riempire il QP di muri fantasma.
+        if (candidates.Count > 0 && (float)unexplained.Count / candidates.Count > maxUnexplainedFraction)
+        {
+            Debug.LogWarning($"Detection scartata: {unexplained.Count}/{candidates.Count} punti non spiegati, localizzazione sospetta");
+            return result;
         }
 
         Dictionary<(int cx, int cy), List<(float x, float y)>> buckets = new Dictionary<(int, int), List<(float, float)>>();
