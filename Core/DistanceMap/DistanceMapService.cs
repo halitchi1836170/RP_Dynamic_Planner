@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using UnityEngine;
 
@@ -104,6 +104,11 @@ public class DistanceMapService
     public float[] getDistanceMap()
     {
         return distanceCalculatedMap;
+    }
+
+    public (int W, int H, float originX, float originY, float resolution) getDistanceMapMetadata()
+    {
+        return (W, H, originX, originY, resolution);
     }
 
     public DistanceMap getDistanceMapInstance()
