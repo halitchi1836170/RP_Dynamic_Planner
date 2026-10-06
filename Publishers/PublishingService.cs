@@ -1,4 +1,4 @@
-using RosMessageTypes.BuiltinInterfaces;
+﻿using RosMessageTypes.BuiltinInterfaces;
 using RosMessageTypes.Geometry;
 using RosMessageTypes.Nav;
 using RosMessageTypes.Sensor;
@@ -577,6 +577,46 @@ public class PublishingService
         pathMsg.poses = poses.ToArray();
 
         ROSConnection.GetOrCreateInstance().Publish(topic, pathMsg);
+    }
+
+    // Come PublishListOfROSPointsAsPointCloud ma conservando la quota: serve a diagnosticare
+    // a che altezza nascono le detection (soffitti, pavimento, ecc.).
+    public void PublishListOfROSPoints3D(List<(float x, float y, float z)> listPoints, string topic)
+    {
+        if (listPoints == null || listPoints.Count == 0)
+        {
+            PublishEmptyPointCloud(topic);
+            return;
+        }
+
+        uint pointStep = 12;
+        uint pointCount = (uint)listPoints.Count;
+        byte[] rawData = new byte[pointStep * pointCount];
+        for (int i = 0; i < listPoints.Count; i++)
+        {
+            int offset = i * (int)pointStep;
+            Array.Copy(BitConverter.GetBytes(listPoints[i].x), 0, rawData, offset, 4);
+            Array.Copy(BitConverter.GetBytes(listPoints[i].y), 0, rawData, offset + 4, 4);
+            Array.Copy(BitConverter.GetBytes(listPoints[i].z), 0, rawData, offset + 8, 4);
+        }
+
+        PointCloud2Msg cloudMsg = new PointCloud2Msg();
+        cloudMsg.header = getPointCloud2MsgHeader();
+        cloudMsg.height = 1;
+        cloudMsg.width = pointCount;
+        cloudMsg.is_dense = true;
+        cloudMsg.is_bigendian = false;
+        cloudMsg.point_step = pointStep;
+        cloudMsg.row_step = pointStep * pointCount;
+        cloudMsg.fields = new PointFieldMsg[]
+        {
+            new PointFieldMsg("x", 0, PointFieldMsg.FLOAT32, 1),
+            new PointFieldMsg("y", 4, PointFieldMsg.FLOAT32, 1),
+            new PointFieldMsg("z", 8, PointFieldMsg.FLOAT32, 1)
+        };
+        cloudMsg.data = rawData;
+
+        ROSConnection.GetOrCreateInstance().Publish(topic, cloudMsg);
     }
 
     public void PublishListOfROSPointsAsPointCloud(List<(float x, float y)> listPoints, string topic)
