@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using UnityEngine.InputSystem;
 using UnityEngine;
 using static UnicycleModelUtilities;
@@ -9,8 +9,8 @@ public class DifferentialDriveController : MonoBehaviour
     public float damping = 100.0f;
     public float forceLimit = 1000.0f;
 
-    public float linearSpeed = 20.0f;
-    public float angularSpeed = 100.0f;
+    public float linearSpeed = 0.3f;     // m/s reali
+    public float angularSpeed = 1.0f;    // rad/s reali
 
     private float lastROSVelocityCommandTime = 0.0f;
     public float thresholdBeforeKeybordControl = 0.5f;
@@ -102,6 +102,10 @@ public class DifferentialDriveController : MonoBehaviour
 
     public void SetVelocity(float v, float w)
     {
+        // Anche /cmd_vel deve farsi da parte: senza questa guardia un nodo ROS che pubblica (anche zeri)
+        // sovrascrive il target dei drive in concorrenza col ControllerService.
+        if (autonomousControlActive) return;
+
         lastROSVelocityCommandTime = Time.time;
         //Debug.Log($"SetVelocity called: v={v}, w={w}");
         var returnAngularV = GetInverseAngularVelocities(articulationBodyRefs.wheelSeparation, articulationBodyRefs.wheelRadius, v, w);
@@ -115,8 +119,10 @@ public class DifferentialDriveController : MonoBehaviour
     private void SetDriveTargetVelocity(ArticulationBody wheel, float velocity)
     {
         // TODO: leggere xDrive, settare targetVelocity, riscrivere xDrive
+        // 'velocity' e' in rad/s, ma targetVelocity di un Velocity drive e' in GRADI/s:
+        // stessa conversione del ControllerService, senza la quale /cmd_vel e tastiera vanno 57x piano.
         ArticulationDrive wheelXDrive = wheel.xDrive;
-        wheelXDrive.targetVelocity = velocity;
+        wheelXDrive.targetVelocity = velocity * Mathf.Rad2Deg;
         wheel.xDrive = wheelXDrive;
         //Debug.Log($"{wheel.name} driveType={wheel.xDrive.driveType} targetVel={wheel.xDrive.targetVelocity} damping={wheel.xDrive.damping}");
     }
