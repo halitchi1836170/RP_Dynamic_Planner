@@ -1,9 +1,9 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using UnityEngine;
 
 public class ArticulationBodyRefs : MonoBehaviour
 {
-    public float wheelRadius = 0.07F;
+    public float wheelRadius = 0.03F;   // URDF: <cylinder radius="0.03" length="0.07"/> - 0.07 e' la LARGHEZZA
     public float wheelSeparation = 0.42F;
 
     public string leftWheelName = "marrtino_left_wheel_link";
