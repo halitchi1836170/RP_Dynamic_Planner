@@ -11,6 +11,9 @@ public class PlotDataService
     public const string POSE_HEADER = "t,gt_x,gt_y,gt_theta,icp_x,icp_y,icp_theta,odo_x,odo_y,odo_theta";
     public const string PLAN_HEADER = "plan_id,t_arm,x,y";
     public const string OBSTACLE_HEADER = "t,id,cx,cy,r";
+    public const string WHEEL_HEADER = "t,wl_cmd,wr_cmd,wl_act,wr_act,wl_target,wr_target";
+    public const string REPLAN_HEADER = "t,robot_x,robot_y,trigger,success,margin,tracks,failures,reason";
+    public const string DETECTION_HEADER = "t,robot_x,robot_y,candidates,unexplained,spread,discarded,clusters,rejected_small,rejected_self,biggest_cluster,confirmed";
 
     private float samplePeriod;
     private float lastPoseSample;
@@ -20,6 +23,9 @@ public class PlotDataService
     private List<string> poseRows;
     private List<string> planRows;
     private List<string> obstacleRows;
+    private List<string> detectionRows;
+    private List<string> replanRows;
+    private List<string> wheelRows;
 
     public PlotDataService(float samplePeriod)
     {
@@ -30,6 +36,50 @@ public class PlotDataService
         this.poseRows = new List<string>();
         this.planRows = new List<string>();
         this.obstacleRows = new List<string>();
+        this.detectionRows = new List<string>();
+        this.replanRows = new List<string>();
+        this.wheelRows = new List<string>();
+    }
+
+    // wl/wr_target e' cio' che sta DAVVERO nel drive (in rad/s): se non coincide con il comando
+    // qualcun altro lo ha sovrascritto fra un passo e l'altro.
+    public void RecordWheels(float t, (float wl, float wr) commanded, float wlActual, float wrActual, float wlTarget, float wrTarget)
+    {
+        wheelRows.Add(string.Join(",", new string[] {
+            F(t), F(commanded.wl), F(commanded.wr), F(wlActual), F(wrActual), F(wlTarget), F(wrTarget) }));
+    }
+
+    public List<string> getWheelRows()
+    {
+        return wheelRows;
+    }
+
+    // Anche i tentativi FALLITI: senza questi un replan che non riesce e' invisibile nei log.
+    public void RecordReplan(float t, (float x, float y, float theta) pose, string trigger, bool success, float margin, int tracks, int failures, string reason)
+    {
+        replanRows.Add(string.Join(",", new string[] {
+            F(t), F(pose.x), F(pose.y), trigger, success ? "1" : "0",
+            F(margin), tracks.ToString(), failures.ToString(), reason }));
+    }
+
+    public List<string> getReplanRows()
+    {
+        return replanRows;
+    }
+
+    public void RecordDetection(float t, (float x, float y, float theta) pose, (int candidates, int unexplained, float spread, bool discarded, int clusters, int rejectedSmall, int rejectedSelf, int biggestCluster) diagnostics, int confirmedTracks)
+    {
+        detectionRows.Add(string.Join(",", new string[] {
+            F(t), F(pose.x), F(pose.y),
+            diagnostics.candidates.ToString(), diagnostics.unexplained.ToString(), F(diagnostics.spread),
+            diagnostics.discarded ? "1" : "0", diagnostics.clusters.ToString(),
+            diagnostics.rejectedSmall.ToString(), diagnostics.rejectedSelf.ToString(), diagnostics.biggestCluster.ToString(),
+            confirmedTracks.ToString() }));
+    }
+
+    public List<string> getDetectionRows()
+    {
+        return detectionRows;
     }
 
     private static string F(double value)
