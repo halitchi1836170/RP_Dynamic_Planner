@@ -40,13 +40,15 @@ public class Orchestrator : MonoBehaviour
     public string smoothedTrajectoryRosTopic = "/smoothed_path";
     public string splinedTrajectoryRosTopic = "/splined_path";
     public string startDebugRosTopic = "/debug/start_pose";
-    public string waypointsDebugRosTopic = "/debug/waypoints";
+    public string waypointsDebugRosTopic = "/debug/waypoints";                 // missione originale
+    public string activeWaypointsDebugRosTopic = "/debug/active_waypoints";    // quelli usati dal piano corrente
     public string goalDebugRosTopic = "/debug/goal_pose";
     public string currentPoseDebugRosTopic = "/debug/current_pose";   // posa corrente (odometria di ruota) in frame ROS
     public string truePoseDebugRosTopic = "/debug/true_pose";         // posa VERA (transform live -> ROS), solo debug
     public string icpPoseLocalizationDebugRosTopic = "/debug/localization/icp_pose";
     public string dynamicObstaclesRosTopic = "/debug/dynamic_obstacles";
     public string trackedObstaclesRosTopic = "/debug/tracked_obstacles";
+    public string unexplainedPointsRosTopic = "/debug/unexplained_points";
 
     public string GRASLAMFIELDS = "FOLLOWING GRAPH SLAM FIELDS";
     public float minDeltaTranslation = 0.1f;
@@ -121,10 +123,15 @@ public class Orchestrator : MonoBehaviour
     private (float x, float y) goalDebugPoint;
     public bool smoothTrajWithLoSPS = true;
     public float epsilonTunnelLoSPS = 0.25f; // Dall'URDF: box base 0.28x0.37 m -> raggio circoscritto ~0.23 m; 0.25 m aggiunge un piccolo margine.
-    public float linearMeanVelocity = 0.3f;
+    public float linearMeanVelocity = 0.08f;
     public (double vel_qi, double acc_qi) qiCouple = (0.0, 0.0);            //unico vettore perché suppongo gli stessi valori sia per x che y 
     public (double vel_qf, double acc_qf) qfCouple = (0.0, 0.0);
     public int subSamplesPerSpline = 30;
+    public float collinearToleranceDeg = 10f;     // vertici quasi allineati: rimossi, danno solo nodi spline
+    public float minVertexSpacing = 0.12f;        // distanza minima fra vertici della spezzata [m]
+    public float waypointRelaxClearance = 0.20f;  // un waypoint dentro un ostacolo viene proiettato sulla
+    public float waypointRelaxRadius = 1.2f;      // cella libera piu' vicina entro questo raggio
+    public float startEscapeRadius = 0.5f;        // se il robot e' dentro un disco, puo' uscirne
     private List<(float, float)> waypoints;
 
     public string CONTROLSTRAtEGIESFIELDS = "FOLLOWING CONTROL SERVICE FIELDS";
@@ -134,12 +141,12 @@ public class Orchestrator : MonoBehaviour
     public bool controlOnGroundTruth = false;
     public bool flipControlOmega = true;
     private (float x, float y, float theta) currentConfig;
-    public float b = 10.0f;
-    public float zeta = 0.8f;
-    public float vMax = 0.5f;       // circa 1.5 volte linearMeanVelocity
-    public float wMax = 2.0f;        // cap di CURVATURA del profilo (rallenta in curva): tienilo fisico ~2
-    public float wMaxClamp = 4.0f;   // clamp di sicurezza su omega del controller: > wMax, da' margine al feedback
-    public float aMax = 0.2f;
+    public float b = 4.0f;
+    public float zeta = 0.9f;
+    public float vMax = 0.2f;       // circa 1.5 volte linearMeanVelocity
+    public float wMax = 0.8f;        // cap di CURVATURA del profilo (rallenta in curva): tienilo fisico ~2
+    public float wMaxClamp = 1.2f;   // clamp di sicurezza su omega del controller: > wMax, da' margine al feedback
+    public float aMax = 0.08f;
     public bool useICPLocalization = true;
     public float minInlierRatio = 0.6f;      // frazione minima di scansione spiegata dalla mappa
     public float maxResidual = 0.25f;        // errore medio max [m]; ~2-3x voxelSize
@@ -149,6 +156,32 @@ public class Orchestrator : MonoBehaviour
     private (float x, float y, float theta) icpLocalizedConfig;
     public int maxIterationLocalization = 7;
 
+    public string REPLANNINGFIELDS = "FOLLOWING REPLANNING FIELDS";
+    public bool replanningEnabled = true;
+    public float persistentObstacleAge = 3.0f;    // eta' minima di un track per giustificare un replan [s]
+    public float replanLookAheadDistance = 1.5f;  // quanto riferimento residuo controllo [m]
+    public float minCBFEngagement = 1.5f;         // secondi di filtro CBF attivo prima di considerare un replan
+    public float engagementMarginThreshold = 0.4f;// ...e solo se un ostacolo dinamico e' entro questo margine
+    public float engagementDeviationThreshold = 0.04f; // ...e se il filtro corregge almeno di tanto
+    public float minReplanInterval = 10f;         // intervallo MINIMO garantito fra due piani [s]
+    public float obstacleInflationMargin = 0.25f; // margine sul raggio quando dipingo l'ostacolo nella griglia [m]
+    public float reducedInflationFactor = 0.5f;   // secondo tentativo se il primo non trova percorso
+    public float stallWindow = 4.0f;              // finestra per il rilevamento di stallo [s]
+    public float stallMinProgress = 0.15f;        // avanzamento sotto il quale sono fermo [m]
+    public float replanMaxDeviation = 0.6f;       // scostamento dal piano oltre il quale ripianifico [m]
+    public float deviationWindow = 1.5f;          // per quanto deve persistere lo scostamento [s]
+    public int maxInfeasibleSteps = 5;
+    public float replanCooldown = 4.0f;
+    public float replanRetryPeriod = 5.0f;
+    public int maxReplanFailures = 3;
+    public float waypointReachedRadius = 0.4f;    // entro questo raggio il waypoint e' considerato raggiunto
+    public float waypointPassedRadius = 1.5f;     // ...e solo entro questo si valuta se lo si e' oltrepassato
+    public float replanCheckPeriod = 0.2f;        // i trigger scorrono la tabella: inutile valutarli ad ogni frame
+    private float lastReplanCheck = 0f;
+    private int nextWaypointIdx = 1;              // 0 e' lo start: i residui partono da 1
+    private string lastPlanningFailure = "none";
+    private ReplanState lastLoggedState = ReplanState.Following;
+
     public string PLOTTINGFIELDS = "FOLLOWING PLOTTING FIELDS";
     public bool recordPlotData = true;
     public float plotSamplePeriod = 0.05f;   // campionamento delle pose per i grafici
@@ -157,37 +190,65 @@ public class Orchestrator : MonoBehaviour
     public string CBFFIELDS = "FOLLOWING CBF SAFETY FILTER FIELDS";
     public bool cbfEnabled = true;
     public float bLookAhead = 0.15f;          // punto avanzato: da autorita di sterzata al QP
-    public float rSafeDynamic = 0.35f;        // >= raggio robot + bLookAhead
+    public float rSafeDynamic = 0.20f;        // >= raggio robot + bLookAhead
     public float rSafeStatic = 0.18f;         // < epsilonTunnelLoSPS, altrimenti litiga col percorso nominale
-    public float alphaDynamic = 1.5f;
-    public float alphaStatic = 1.5f;
+    public float alphaDynamic = 0.8f;
+    public float alphaStatic = 0.8f;
     public float gammaCLF = 0.5f;
     public float slackPenalty = 100f;
+    public float cbfSlackPenalty = 10000f;    // barriere soft ad altissimo costo: il QP non e' mai infeasible
+    public float commandSmoothingWeight = 0.5f;  // smorza l'alternanza destra/sinistra del QP; 0 = disattivato
     public float vDeviationWeight = 1.0f;     // costo di deviare dalla v nominale
     public float wDeviationWeight = 0.2f;     // < vDeviationWeight -> il QP sterza invece di frenare
     public float staticActivationDistance = 0.6f;
     public float obstacleActivationRange = 3.0f;
     public float gradientStepCells = 2f;
     public float cbfActivationTolerance = 1e-3f;
+    public float robotBodyRadius = 0.23f;     // raggio circoscritto della scocca: seconda barriera sul CORPO
     public float referenceMaxLag = 0.20f;     // il riferimento aspetta solo oltre questo scarto [m]
-    public float wMaxCBF = 1.5f;              // limite di omega DEL QP: molto sotto wMaxClamp, altrimenti strattona
-    public float maxLinearAccelCommand = 1.0f;    // slew rate del comando v [m/s^2]
-    public float maxAngularAccelCommand = 3.0f;   // slew rate del comando omega [rad/s^2]
+    public float wMaxCBF = 0.9f;              // limite di omega DEL QP: molto sotto wMaxClamp, altrimenti strattona
+    public float maxLinearAccelCommand = 0.3f;    // slew rate del comando v [m/s^2]
+    public float maxAngularAccelCommand = 1.5f;   // slew rate del comando omega [rad/s^2]
 
     public string OBSTACLESMANAGERFILEDS = "FOLLOWING DYNAMIC OBSTACLES MANAGER FIELDS";
-    private List<(float cx, float cy, float r)> obstaclesCentroidsSensed;
-    public float obsTol = 0.2f;             // tolleranza "spiegato dalla mappa" a range 0 [m]: tol(d) = obsTol + obsTolPerMeter*d
-    public float obsTolPerMeter = 0.03f;    // crescita della tolleranza col range (errore di heading + rumore + chamfer)
+    private List<(float cx, float cy, float r, int n)> obstaclesCentroidsSensed;
+    public float obsTol = 0.12f;            // tolleranza "spiegato dalla mappa" a range 0 [m]: tol(d) = obsTol + obsTolPerMeter*d
+                                            // NB: un ostacolo addossato a un muro ha poca clearance: se la
+                                            // tolleranza e' alta i suoi punti sembrano "gia' nella mappa"
+    public float obsTolPerMeter = 0.02f;    // crescita della tolleranza col range (errore di heading + rumore + chamfer)
     public float maxDetectionRange = 3.5f;  // oltre: punti ignorati (alla CBF servono solo gli ostacoli vicini)
     public float clusteringRadius = 0.3f;
-    public int minClusterPoints = 4;       // sotto = rumore (punti gia' downsampled a voxelSize)
-    public float clusterMargin = 0.05f;    // margine sul raggio del cerchio di ingombro [m]
-    public float maxUnexplainedFraction = 0.5f;   // oltre: scansione scartata (posa sospetta)
+    public int minClusterPoints = 4;       // sotto = rumore (punti gia' downsampled a detectionVoxelSize)
+    public int minClusterPointsNear = 2;   // soglia entro nearClusterRange: da vicino i voxel sono pochi
+    public float nearClusterRange = 1.5f;
+    public float detectionVoxelSize = 0.05f;  // piu' fine di voxelSize (ICP): quadruplica i punti su una superficie
+    public float clusterMargin = 0.03f;    // margine sul raggio del cerchio di ingombro [m]
+    public float maxUnexplainedFraction = 0.5f;   // oltre: scansione scartata (posa sospetta)...
+    public float minSuspiciousSpread = 2.0f;      // ...ma solo se i punti sono sparsi su piu' di tanto [m]
+    public float selfHitRadius = 0.28f;           // usato solo se useChassisFootprint = false
+    public bool useChassisFootprint = true;       // scarta gli auto-hit col rettangolo VERO della scocca
+    public float chassisFront = 0.04f;            // URDF: box 0.28x0.37, laser a +0.10 -> davanti restano 4 cm
+    public float chassisRear = 0.24f;
+    public float chassisHalfWidth = 0.19f;
+    public float chassisTopRelLaser = -0.125f;    // tetto scocca 0.21 - quota laser 0.335
+    public float chassisMargin = 0.04f;
+    public float obstacleZMin = 0.15f;            // banda di quota per la detection (indipendente da quella di mapping)
+    public float obstacleZMax = 1.00f;            // il soffitto lo scarta il gate di elevazione, non serve stringere qui
+    public float maxElevationDeg = 12f;           // scarta i raggi troppo inclinati: soffitti e pavimento
     public float trackGate = 0.5f;          // associazione detection-track: distanza max [m]
     public float trackAlphaLowpass = 0.3f;  // filtro sulla velocita' stimata
     public float trackVDeadzone = 0.05f;    // sotto: velocita' = 0 (jitter del centroide) [m/s]
     public int trackMinHits = 3;            // scan consecutivi per confermare un track
     public float trackForgetTime = 1.0f;    // track non visto da piu' di tanto: rimosso [s]
+    public float blindZoneRadius = 0.7f;    // oltre al raggio del track: entro qui il sensore non vede
+    public float blindZoneForgetFactor = 6f;// quanto piu' a lungo si ricorda un track nella zona cieca
+    public int minPointsForUpdate = 4;      // sotto: cluster troppo povero per spostare centro e raggio
+    public float radiusDecayPerUpdate = 0.98f;  // decadimento LENTO, e solo su osservazioni buone
+    public float blindZoneGrowthRate = 0.05f;   // [m/s] il raggio cresce finche' il track non si rivede
+    public float maxBlindGrowth = 0.20f;        // tetto al gonfiaggio: oltre, il track e' solo rumore
+    public float closeRangeMergeGate = 0.15f;  // quanto vicino deve stare un track per considerare la detection gia' coperta
+    public float closeRangeOverride = 1.3f; // sotto questa distanza le detection GREZZE vanno alla CBF
+                                            // senza passare da conferma e tracking: ultima rete di sicurezza
 
     //--------------------------------------------------------------------------------------------------------------------------------------------------------
     //                                                                    HARDWARE FIELDS
@@ -221,7 +282,9 @@ public class Orchestrator : MonoBehaviour
     private DynamicObstacleService dynamicObstacleService;
     private ObstacleTrackerService obstacleTrackerService;
     private CBFService cbfService;
+    private DistanceMap pristineDistanceMap;
     private PlotDataService plotDataService;
+    private ReplanningService replanningService;
 
     //--------------------------------------------------------------------------------------------------------------------------------------------------------
     //                                                                       ROBOT STATE
@@ -264,13 +327,16 @@ public class Orchestrator : MonoBehaviour
         occupancyGridService = new OccupancyGridService(resolution, zMin, zMax, bodyRadius, probOcc, probFree, occBlockThreshold, elevThrehsold);
         ioService = new IOFileOperationService(occupancyGridMapFileName);
         distanceMapService = new DistanceMapService(obstacleThreshold, k, eps);
-        motionPlannerService = new MotionPlannerService(smoothTrajWithLoSPS, epsilonTunnelLoSPS, linearMeanVelocity, qiCouple, qfCouple, subSamplesPerSpline, secondsControlFrequency, wMax, aMax, vMax);
+        motionPlannerService = new MotionPlannerService(smoothTrajWithLoSPS, epsilonTunnelLoSPS, linearMeanVelocity, qiCouple, qfCouple, subSamplesPerSpline, secondsControlFrequency, wMax, aMax, vMax, waypointRelaxClearance, waypointRelaxRadius, startEscapeRadius, collinearToleranceDeg, minVertexSpacing);
         plotDataService = new PlotDataService(plotSamplePeriod);
-        cbfService = new CBFService(bLookAhead, rSafeDynamic, rSafeStatic, alphaDynamic, alphaStatic, gammaCLF, slackPenalty, vDeviationWeight, wDeviationWeight, staticActivationDistance, obstacleActivationRange, gradientStepCells, cbfActivationTolerance, wMaxCBF);
+        replanningService = new ReplanningService(persistentObstacleAge, replanLookAheadDistance, obstacleInflationMargin, stallWindow, stallMinProgress, replanMaxDeviation, deviationWindow, maxInfeasibleSteps, minCBFEngagement, engagementMarginThreshold, engagementDeviationThreshold, minReplanInterval, replanCooldown, replanRetryPeriod, maxReplanFailures);
+        cbfService = new CBFService(bLookAhead, rSafeDynamic, rSafeStatic, alphaDynamic, alphaStatic, gammaCLF, slackPenalty, cbfSlackPenalty, commandSmoothingWeight, vDeviationWeight, wDeviationWeight, staticActivationDistance, obstacleActivationRange, gradientStepCells, cbfActivationTolerance, wMaxCBF, robotBodyRadius);
         controllerService = new ControllerService(secondsControlFrequency, controlStrategy, (leftWheel, rightWheel), wheelRadius, wheelSeparation, b, zeta, vMax, wMaxClamp, referenceMaxLag, maxLinearAccelCommand, maxAngularAccelCommand, cbfEnabled, cbfService);
         localizationService = new LocalizationService(icpService, marrtionLaserLinkTransform, minInlierRatio, maxResidual, maxLocalizationJump);
-        dynamicObstacleService = new DynamicObstacleService(voxelSize, marrtionLaserLinkTransform, zMin, zMax, bodyRadius, obsTol, obsTolPerMeter, maxDetectionRange, clusteringRadius, minClusterPoints, clusterMargin, maxUnexplainedFraction);
-        obstacleTrackerService = new ObstacleTrackerService(trackGate, trackAlphaLowpass, trackVDeadzone, trackMinHits, trackForgetTime);
+        dynamicObstacleService = new DynamicObstacleService(detectionVoxelSize, marrtionLaserLinkTransform, selfHitRadius, obsTol, obsTolPerMeter, maxDetectionRange, clusteringRadius, minClusterPoints, minClusterPointsNear, nearClusterRange, clusterMargin, maxUnexplainedFraction, minSuspiciousSpread, obstacleZMin, obstacleZMax, maxElevationDeg,
+            useChassisFootprint, chassisFront, chassisRear, chassisHalfWidth, chassisTopRelLaser, chassisMargin);
+        obstacleTrackerService = new ObstacleTrackerService(trackGate, trackAlphaLowpass, trackVDeadzone, trackMinHits, trackForgetTime, blindZoneRadius, blindZoneForgetFactor,
+            minPointsForUpdate, radiusDecayPerUpdate, blindZoneGrowthRate, maxBlindGrowth);
 
 
         //------------------REGISTRAZIONE EVENTI
@@ -299,13 +365,15 @@ public class Orchestrator : MonoBehaviour
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PathMsg>(smoothedTrajectoryRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PathMsg>(splinedTrajectoryRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(startDebugRosTopic);
-        ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(waypointsDebugRosTopic);          // PublishListOfROSPoints manda un nav_msgs/Path
+        ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(waypointsDebugRosTopic);
+        ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(activeWaypointsDebugRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(goalDebugRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(currentPoseDebugRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(truePoseDebugRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(icpPoseLocalizationDebugRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(dynamicObstaclesRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(trackedObstaclesRosTopic);
+        ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(unexplainedPointsRosTopic);
 
         //------------------ONE TIME ACTIONS
         if (calculateAndOverrideOccupancyMapFlag == false)
@@ -324,7 +392,11 @@ public class Orchestrator : MonoBehaviour
             occupancyGridCachedReady = true;
             distanceMapService.SetOccupancyGridMap(occGrid);
             distanceMapService.calculateDistanceMap();
-            cbfService.SetDistanceMap(distanceMapService.getDistanceMapInstance());
+            // ESPLICITO: la CBF usa per sempre la EDT della mappa PRISTINA. Il replanning ricalcola la
+            // distance map sulla griglia gonfiata, e se la CBF la seguisse conterebbe gli ostacoli due volte
+            // (una nella barriera statica, una in quelle dinamiche).
+            pristineDistanceMap = distanceMapService.getDistanceMapInstance();
+            cbfService.SetDistanceMap(pristineDistanceMap);
             publisherService.PublishDistanceMap(distanceMapService.getDistanceMapForPublisher(), distanceMapRosTopic);
             distanceMapComputed = true;
 
@@ -333,18 +405,13 @@ public class Orchestrator : MonoBehaviour
                 waypoints = readWaypointNodes();   // [start (robot), 1_NODE, 2_NODE, ..., GOAL]
                 startDebugPoint = waypoints[0];
                 goalDebugPoint = waypoints[waypoints.Count - 1];
-                motionPlannerService.DetermineGeometricTrajectoryFromWaypoints(distanceMapService.getDistanceMapInstance(), waypoints, plannerMode);
-                trajectoryPlanned = motionPlannerService.GeometricTrajectoryDetermined();
-                motionPlannerService.LetsSplineGeometricTrajectory();
-                motionPlannerService.DetermineGeomtricTrajectoryFromSplines();
+                nextWaypointIdx = 1;
+                trajectoryPlanned = RunPlanningPipeline(waypoints, distanceMapService.getDistanceMapInstance());
             }
 
             if(motionPlannerService.GeometricTrajectoryDetermined() && boolControlMarrtino)
             {
-                controllerService.Arm(motionPlannerService.getGeometricTrajectoryForController());
-                if (recordPlotData) plotDataService.RecordPlan(Time.time, motionPlannerService.getGeometricTrajectoryForController());
                 if (differentialDriveController != null) differentialDriveController.autonomousControlActive = true;   // la tastiera si fa da parte
-                //controllerService.FollowTrajectory(motionPlannerService.getGeometricTrajectoryForController());
             }
 
         }
@@ -373,9 +440,12 @@ public class Orchestrator : MonoBehaviour
 
         if( (!calculateAndOverrideOccupancyMapFlag) && boolControlMarrtino && trajectoryPlanned && Time.time - lastTrajectoryPublish > plannedTrajectoryRepublishPeriod)
         {
-            publisherService.PublishPlannedTrajectory(motionPlannerService.getGeometricTrajectoryWorld(), plannedTrajectoryRosTopic);
-            if (smoothTrajWithLoSPS) publisherService.PublishPlannedTrajectory(motionPlannerService.getGeometricSmoothTrajectoryWorld(), smoothedTrajectoryRosTopic);
-            publisherService.PublishLSplinedGeometricTrajectory(motionPlannerService.getSplinedGeomtricTrajectory(), splinedTrajectoryRosTopic);
+            if (motionPlannerService.getGeometricTrajectoryWorld().Count > 0)
+            {
+                publisherService.PublishPlannedTrajectory(motionPlannerService.getGeometricTrajectoryWorld(), plannedTrajectoryRosTopic);
+                if (smoothTrajWithLoSPS) publisherService.PublishPlannedTrajectory(motionPlannerService.getGeometricSmoothTrajectoryWorld(), smoothedTrajectoryRosTopic);
+                publisherService.PublishLSplinedGeometricTrajectory(motionPlannerService.getSplinedGeomtricTrajectory(), splinedTrajectoryRosTopic);
+            }
             publisherService.PublishDebugPoint(startDebugPoint, startDebugRosTopic);
             if(waypoints.Count > 0)
             {
@@ -389,6 +459,12 @@ public class Orchestrator : MonoBehaviour
                 publisherService.PublishListOfROSPointsAsPointCloud(listWayPoints, waypointsDebugRosTopic);
             }
             publisherService.PublishDebugPoint(goalDebugPoint, goalDebugRosTopic);
+
+            // I tre path sopra vengono gia' dal piano CORRENTE (il planner viene azzerato e ricostruito
+            // a ogni replan): qui si pubblicano i waypoint che quel piano insegue davvero, che dopo un
+            // rilassamento NON coincidono piu' con quelli della missione.
+            publisherService.PublishListOfROSPointsAsPointCloud(motionPlannerService.getEffectiveWaypoints(), activeWaypointsDebugRosTopic);
+
             lastTrajectoryPublish = Time.time;
         }
 
@@ -400,9 +476,32 @@ public class Orchestrator : MonoBehaviour
             plotDataService.RecordPose(Time.time, (gtPose.trx, gtPose.trty, gtThetaPose), icpLocalizedConfig, (xo, -yo, -tho));
         }
 
-        if (recordPlotData && !plotDataDumped && trajectoryPlanned && boolControlMarrtino && !controllerService.isControllerActive())
+        if (recordPlotData && !plotDataDumped && trajectoryPlanned && boolControlMarrtino && controllerService.isTrajectoryCompleted())
         {
             DumpPlotData();
+        }
+
+        if (replanningEnabled && (!calculateAndOverrideOccupancyMapFlag) && boolControlMarrtino && trajectoryPlanned
+            && Time.time - lastReplanCheck > replanCheckPeriod)
+        {
+            lastReplanCheck = Time.time;
+            (float x, float y, float theta) pose = getControlPose();
+            updateNextWaypointIndex(pose);
+
+            ReplanTrigger trigger = replanningService.EvaluateTriggers(Time.time, pose, obstacleTrackerService.GetConfirmedTracks(),
+                controllerService.getTrajectoryTable(), controllerService.getReferenceIndex(), getPlanDeviation(pose));
+
+            if (trigger != ReplanTrigger.None)
+            {
+                Debug.Log($"Trigger {trigger} (CBF attiva da {replanningService.getCBFEngagementTime():F1}s, scarto {getPlanDeviation(pose):F2} m)");
+                ExecuteReplanning(pose, trigger);
+            }
+
+            if (replanningService.getState() != lastLoggedState)
+            {
+                lastLoggedState = replanningService.getState();
+                Debug.Log($"Stato replanning: {lastLoggedState}");
+            }
         }
 
         if (odometryService.isTimeToLocalize())
@@ -442,24 +541,10 @@ public class Orchestrator : MonoBehaviour
 
         if( (!calculateAndOverrideOccupancyMapFlag) && boolControlMarrtino && controllerService.isTimeToControl())
         {
-            (float x, float y, float theta) currentConfigRos;
-            if (controlOnGroundTruth)
-            {
-                (float grx, float gry, float grz) gt = UnityToRosPosition(marrtionLaserLinkTransform.position.x, marrtionLaserLinkTransform.position.y, marrtionLaserLinkTransform.position.z);
-                float gtTheta = Mathf.Atan2(-marrtionLaserLinkTransform.forward.x, marrtionLaserLinkTransform.forward.z);
-                currentConfigRos = (gt.grx, gt.gry, gtTheta);
-            }
-            else if (useICPLocalization)
-            {
-                currentConfigRos = icpLocalizedConfig;
-            }
-            else
-            {
-                (float xo, float yo, float tho) = odometryService.getUpdatedConfiguration();
-                currentConfigRos = (xo, -yo, -tho);
-            }
+            (float x, float y, float theta) currentConfigRos = getControlPose();
 
             (double v, double w) feedbackControl = controllerService.ControlStep(currentConfigRos);
+            replanningService.NotifyControlStep(controllerService.isLastCBFFeasible(), controllerService.getLastCBFDeviation(), cbfService.getLastDiagnostics().minMargin, Time.time);
 
             if (recordPlotData)
             {
@@ -468,12 +553,220 @@ public class Orchestrator : MonoBehaviour
 
             if (flipControlOmega) feedbackControl.w = -feedbackControl.w;
             controllerService.applyToWheels(feedbackControl);
+
+            if (recordPlotData)
+            {
+                plotDataService.RecordWheels(Time.time, controllerService.getLastWheelCommand(), leftWheel.jointVelocity[0], rightWheel.jointVelocity[0],
+                    leftWheel.xDrive.targetVelocity * Mathf.Deg2Rad, rightWheel.xDrive.targetVelocity * Mathf.Deg2Rad);
+            }
         }
 
      
         if (calculateAndOverrideOccupancyMapFlag && loopClosureMode == LoopClosureFinder.TimeAndConeBased)
         {
             publisherService.PublishConeFan(marrtionLaserLinkTransform.position, marrtionLaserLinkTransform.forward, halfConeAngleLoopClosureFinder, thresholdLoopClosure, maxRadiusLoopClosureFinder, coneFanTopic);
+        }
+    }
+
+    // Un ostacolo marginale (pochi punti, conferme intermittenti) puo' non diventare mai un track:
+    // da vicino e' inaccettabile perderlo, quindi le detection grezze ravvicinate entrano comunque
+    // nel QP. Velocita' nulla: su una singola scansione non e' stimabile.
+    private List<(float cx, float cy, float r, float vx, float vy)> mergeCloseRangeDetections(List<(float cx, float cy, float r, float vx, float vy)> tracked, List<(float cx, float cy, float r, int n)> detections, (float x, float y, float theta) pose)
+    {
+        if (detections == null) return tracked;
+
+        foreach ((float cx, float cy, float r, int n) detection in detections)
+        {
+            float dx = detection.cx - pose.x;
+            float dy = detection.cy - pose.y;
+            if (Mathf.Sqrt(dx * dx + dy * dy) > closeRangeOverride) continue;
+
+            bool alreadyTracked = false;
+            foreach ((float cx, float cy, float r, float vx, float vy) t in tracked)
+            {
+                float ex = t.cx - detection.cx;
+                float ey = t.cy - detection.cy;
+                // gate STRETTO: con 0.5 m un track sbagliato sopprimeva la detection fresca che
+                // avrebbe dovuto scavalcarlo, disattivando proprio la rete di sicurezza
+                if (ex * ex + ey * ey < closeRangeMergeGate * closeRangeMergeGate) { alreadyTracked = true; break; }
+            }
+            if (!alreadyTracked) tracked.Add((detection.cx, detection.cy, detection.r, 0f, 0f));
+        }
+        return tracked;
+    }
+
+    private List<(float cx, float cy, float r)> toCircles(List<(float cx, float cy, float r, int n)> detections)
+    {
+        List<(float cx, float cy, float r)> circles = new List<(float, float, float)>();
+        foreach ((float cx, float cy, float r, int n) detection in detections) circles.Add((detection.cx, detection.cy, detection.r));
+        return circles;
+    }
+
+    // Posa su cui si chiude l'anello di controllo, nella convenzione ROS.
+    private (float x, float y, float theta) getControlPose()
+    {
+        if (controlOnGroundTruth)
+        {
+            (float grx, float gry, float grz) gt = UnityToRosPosition(marrtionLaserLinkTransform.position.x, marrtionLaserLinkTransform.position.y, marrtionLaserLinkTransform.position.z);
+            return (gt.grx, gt.gry, Mathf.Atan2(-marrtionLaserLinkTransform.forward.x, marrtionLaserLinkTransform.forward.z));
+        }
+        if (useICPLocalization) return icpLocalizedConfig;
+
+        (float xo, float yo, float tho) = odometryService.getUpdatedConfiguration();
+        return (xo, -yo, -tho);
+    }
+
+    // Pipeline completa A* -> LOS-PS -> spline -> profilo -> Arm. Usata sia all'avvio sia dal replanning.
+    private bool RunPlanningPipeline(List<(float, float)> wps, DistanceMap dmap)
+    {
+        motionPlannerService.Reset();
+        lastPlanningFailure = "none";
+
+        if (!motionPlannerService.DetermineGeometricTrajectoryFromWaypoints(dmap, wps, plannerMode))
+        {
+            lastPlanningFailure = "noPath";
+            Debug.LogWarning("Pianificazione fallita: nessun percorso per i waypoint richiesti");
+            return false;
+        }
+
+        motionPlannerService.LetsSplineGeometricTrajectory();
+        motionPlannerService.DetermineGeomtricTrajectoryFromSplines();
+
+        List<(float t, float x, float y, float xd, float yd, float xdd, float ydd)> table = motionPlannerService.getGeometricTrajectoryForController();
+        if (!motionPlannerService.ControllerTrajectoryIsFinite())
+        {
+            lastPlanningFailure = "badTable";
+            Debug.LogWarning($"Pianificazione fallita: tabella non valida ({table.Count} righe). "
+                + $"A*={motionPlannerService.getGeometricTrajectoryWorld().Count} punti, "
+                + $"LOS-PS={motionPlannerService.getGeometricSmoothTrajectoryWorld().Count} punti, "
+                + $"spacing minimo={motionPlannerService.getMinConsecutiveSpacing():F4} m");
+            return false;
+        }
+
+        if (boolControlMarrtino) controllerService.Arm(table);
+        if (recordPlotData) plotDataService.RecordPlan(Time.time, table);
+        return true;
+    }
+
+    // Waypoint non ancora raggiunti, preceduti dalla posa corrente: e' da li' che riparte il nuovo piano.
+    private List<(float, float)> getRemainingWaypoints((float x, float y, float theta) fromPose)
+    {
+        List<(float, float)> remaining = new List<(float, float)>();
+        remaining.Add((fromPose.x, fromPose.y));
+        for (int i = nextWaypointIdx; i < waypoints.Count; i++) remaining.Add(waypoints[i]);
+        return remaining;
+    }
+
+    private void updateNextWaypointIndex((float x, float y, float theta) pose)
+    {
+        if (waypoints == null || nextWaypointIdx >= waypoints.Count - 1) return;   // il goal non si consuma
+
+        // Il solo criterio di prossimita' non basta: evitando un ostacolo il robot puo' girare al largo
+        // e non passare MAI entro waypointReachedRadius, lasciando l'indice bloccato su un waypoint che
+        // si e' di fatto lasciato alle spalle. Si considera superato anche chi e' finito dietro il piano
+        // perpendicolare al segmento verso il waypoint successivo.
+        while (nextWaypointIdx < waypoints.Count - 1)
+        {
+            float dx = waypoints[nextWaypointIdx].Item1 - pose.x;
+            float dy = waypoints[nextWaypointIdx].Item2 - pose.y;
+            bool nearEnough = dx * dx + dy * dy < waypointReachedRadius * waypointReachedRadius;
+
+            float sx = waypoints[nextWaypointIdx + 1].Item1 - waypoints[nextWaypointIdx].Item1;
+            float sy = waypoints[nextWaypointIdx + 1].Item2 - waypoints[nextWaypointIdx].Item2;
+
+            // Il criterio del semipiano vale SOLO da vicino: su un percorso che si richiude, un
+            // waypoint lontano risulta facilmente "oltrepassato" e verrebbe saltato, violando
+            // l'ordine della missione.
+            bool closeEnoughToJudge = dx * dx + dy * dy < waypointPassedRadius * waypointPassedRadius;
+            bool passed = closeEnoughToJudge
+                && (pose.x - waypoints[nextWaypointIdx].Item1) * sx + (pose.y - waypoints[nextWaypointIdx].Item2) * sy > 0f;
+
+            if (!nearEnough && !passed) break;
+            nextWaypointIdx += 1;
+            Debug.Log($"Waypoint {nextWaypointIdx - 1} superato (vicino={nearEnough}, oltrepassato={passed}) -> prossimo {nextWaypointIdx}");
+        }
+    }
+
+    // Distanza dal punto piu' vicino del piano attivo: misura lo scostamento per il trigger.
+    private float getPlanDeviation((float x, float y, float theta) pose)
+    {
+        List<(float t, float x, float y, float xd, float yd, float xdd, float ydd)> table = controllerService.getTrajectoryTable();
+        if (table.Count == 0) return 0f;
+
+        float best = float.MaxValue;
+        foreach ((float t, float x, float y, float xd, float yd, float xdd, float ydd) row in table)
+        {
+            float dx = row.x - pose.x;
+            float dy = row.y - pose.y;
+            float sq = dx * dx + dy * dy;
+            if (sq < best) best = sq;
+        }
+        return Mathf.Sqrt(best);
+    }
+
+    private bool tryPlanWithInflation((float x, float y, float theta) currentPose, List<ObstacleTrack> tracks, float margin)
+    {
+        (sbyte[] data, int W, int H, float originX, float originY, float resolution) inflated = replanningService.InflateOccupancyGrid(occupancyGridCached, tracks, Time.time, margin);
+
+        distanceMapService.SetOccupancyGridMap(inflated);
+        distanceMapService.calculateDistanceMap();
+        publisherService.PublishDistanceMap(distanceMapService.getDistanceMapForPublisher(), distanceMapRosTopic);
+
+        return RunPlanningPipeline(getRemainingWaypoints(currentPose), distanceMapService.getDistanceMapInstance());
+    }
+
+    // Il servizio resta con la griglia gonfiata dopo un replan: va riportato alla mappa vera, altrimenti
+    // cio' che viene pubblicato (e chiunque legga la mappa viva) continua a mostrare ostacoli inventati.
+    private void restorePristineDistanceMap()
+    {
+        distanceMapService.SetOccupancyGridMap(occupancyGridCached);
+        distanceMapService.calculateDistanceMap();
+        publisherService.PublishDistanceMap(distanceMapService.getDistanceMapForPublisher(), distanceMapRosTopic);
+    }
+
+    // Ferma il robot, gonfia la griglia PRISTINA con gli ostacoli persistenti, ricalcola la EDT e ripianifica.
+    private void ExecuteReplanning((float x, float y, float theta) currentPose, ReplanTrigger trigger)
+    {
+        Debug.Log($"Replanning (trigger: {trigger}) dalla posa ({currentPose.x:F2}, {currentPose.y:F2})");
+
+        controllerService.Disarm();
+        controllerService.applyToWheels((0.0, 0.0));
+
+        List<ObstacleTrack> tracks = obstacleTrackerService.GetConfirmedTracks();
+
+        // In corridoio stretto il disco gonfiato puo' essere piu' largo della clearance disponibile e
+        // chiudere il passaggio: meglio un percorso rasente che nessun percorso. Si riprova a margine ridotto.
+        bool success = tryPlanWithInflation(currentPose, tracks, replanningService.getInflationMargin());
+        float usedMargin = replanningService.getInflationMargin();
+        if (!success)
+        {
+            usedMargin = replanningService.getInflationMargin() * reducedInflationFactor;
+            Debug.LogWarning($"Replanning: nessun percorso con margine {replanningService.getInflationMargin():F2} m, riprovo con {usedMargin:F2} m");
+            success = tryPlanWithInflation(currentPose, tracks, usedMargin);
+        }
+        if (!success)
+        {
+            usedMargin = 0f;   // solo l'ingombro misurato: resta comunque la CBF a tenere le distanze
+            Debug.LogWarning("Replanning: riprovo senza margine di inflazione");
+            success = tryPlanWithInflation(currentPose, tracks, usedMargin);
+        }
+        replanningService.NotifyReplanResult(success, Time.time);
+        if (recordPlotData) plotDataService.RecordReplan(Time.time, currentPose, trigger.ToString(), success, usedMargin, tracks.Count, replanningService.getFailureCount(), lastPlanningFailure);
+
+        if (success)
+        {
+            lastTrajectoryPublish = 0f;   // forza la ripubblicazione del nuovo percorso
+        }
+        else
+        {
+            // Riprendere il vecchio piano va bene per un fallimento isolato, NON quando il planner
+            // ha concluso ripetutamente che un percorso non esiste: li' significa andare addosso
+            // all'ostacolo. In stato Blocked si resta fermi, ma i trigger continuano a girare,
+            // quindi si riparte da soli appena la situazione si sblocca.
+            if (replanningService.isBlocked()) controllerService.applyToWheels((0.0, 0.0));
+            else controllerService.ReArm();
+            restorePristineDistanceMap();
+            Debug.LogWarning($"Replanning fallito: riprendo il piano precedente (stato {replanningService.getState()})");
         }
     }
 
@@ -517,6 +810,9 @@ public class Orchestrator : MonoBehaviour
         ioService.WriteCsv("poses.csv", PlotDataService.POSE_HEADER, plotDataService.getPoseRows());
         ioService.WriteCsv("plans.csv", PlotDataService.PLAN_HEADER, plotDataService.getPlanRows());
         ioService.WriteCsv("obstacles.csv", PlotDataService.OBSTACLE_HEADER, plotDataService.getObstacleRows());
+        ioService.WriteCsv("detection.csv", PlotDataService.DETECTION_HEADER, plotDataService.getDetectionRows());
+        ioService.WriteCsv("replans.csv", PlotDataService.REPLAN_HEADER, plotDataService.getReplanRows());
+        ioService.WriteCsv("wheels.csv", PlotDataService.WHEEL_HEADER, plotDataService.getWheelRows());
         ioService.WriteCsv("limits.csv", "name,value", getPlotLimits());
         if (distanceMapComputed)
         {
@@ -540,6 +836,46 @@ public class Orchestrator : MonoBehaviour
             "maxLinearAccelCommand," + maxLinearAccelCommand.ToString(inv),
             "maxAngularAccelCommand," + maxAngularAccelCommand.ToString(inv),
             "rSafeStatic," + rSafeStatic.ToString(inv),
+            "commandSmoothingWeight," + commandSmoothingWeight.ToString(inv),
+            "selfHitRadius," + selfHitRadius.ToString(inv),
+            "closeRangeOverride," + closeRangeOverride.ToString(inv),
+            "obsTol," + obsTol.ToString(inv),
+            "obsTolPerMeter," + obsTolPerMeter.ToString(inv),
+            "maxDetectionRange," + maxDetectionRange.ToString(inv),
+            "obstacleZMin," + obstacleZMin.ToString(inv),
+            "obstacleZMax," + obstacleZMax.ToString(inv),
+            "maxElevationDeg," + maxElevationDeg.ToString(inv),
+            "clusteringRadius," + clusteringRadius.ToString(inv),
+            "minClusterPoints," + minClusterPoints.ToString(inv),
+            "clusterMargin," + clusterMargin.ToString(inv),
+            "maxUnexplainedFraction," + maxUnexplainedFraction.ToString(inv),
+            "minSuspiciousSpread," + minSuspiciousSpread.ToString(inv),
+            "trackMinHits," + trackMinHits.ToString(inv),
+            "trackForgetTime," + trackForgetTime.ToString(inv),
+            "trackGate," + trackGate.ToString(inv),
+            "blindZoneRadius," + blindZoneRadius.ToString(inv),
+            "wheelRadius," + wheelRadius.ToString(inv),
+            "wheelSeparation," + wheelSeparation.ToString(inv),
+            "useChassisFootprint," + (useChassisFootprint ? "1" : "0"),
+            "robotBodyRadius," + robotBodyRadius.ToString(inv),
+            "minPointsForUpdate," + minPointsForUpdate.ToString(inv),
+            "radiusDecayPerUpdate," + radiusDecayPerUpdate.ToString(inv),
+            "blindZoneGrowthRate," + blindZoneGrowthRate.ToString(inv),
+            "maxBlindGrowth," + maxBlindGrowth.ToString(inv),
+            "engagementMarginThreshold," + engagementMarginThreshold.ToString(inv),
+            "engagementDeviationThreshold," + engagementDeviationThreshold.ToString(inv),
+            "minReplanInterval," + minReplanInterval.ToString(inv),
+            "waypointPassedRadius," + waypointPassedRadius.ToString(inv),
+            "collinearToleranceDeg," + collinearToleranceDeg.ToString(inv),
+            "minVertexSpacing," + minVertexSpacing.ToString(inv),
+            "waypointRelaxClearance," + waypointRelaxClearance.ToString(inv),
+            "waypointRelaxRadius," + waypointRelaxRadius.ToString(inv),
+            "startEscapeRadius," + startEscapeRadius.ToString(inv),
+            "closeRangeMergeGate," + closeRangeMergeGate.ToString(inv),
+            "voxelSize," + voxelSize.ToString(inv),
+            "detectionVoxelSize," + detectionVoxelSize.ToString(inv),
+            "minClusterPointsNear," + minClusterPointsNear.ToString(inv),
+            "nearClusterRange," + nearClusterRange.ToString(inv),
             "rSafeDynamic," + rSafeDynamic.ToString(inv),
             "bLookAhead," + bLookAhead.ToString(inv),
         };
@@ -572,14 +908,19 @@ public class Orchestrator : MonoBehaviour
 
     void ScanCompletedNavigation()
     {
-        obstaclesCentroidsSensed = dynamicObstacleService.getROSObstacleCentroids(lidar.ScannedPoints, localizationService.GetTMapLaser(), distanceMapService.getDistanceMapInstance());
+        obstaclesCentroidsSensed = dynamicObstacleService.getROSObstacleCentroids(lidar.ScannedPoints, localizationService.GetTMapLaser(), pristineDistanceMap);
         //Debug.Log($"Sensed and publishing {obstaclesCentroidsSensed.Count} obstacles centroids...");
-        publisherService.PublishListOfObstacleCentroids(obstaclesCentroidsSensed, dynamicObstaclesRosTopic);
+        publisherService.PublishListOfObstacleCentroids(toCircles(obstaclesCentroidsSensed), dynamicObstaclesRosTopic);
 
-        obstacleTrackerService.Update(obstaclesCentroidsSensed, Time.time);
+        obstacleTrackerService.Update(obstaclesCentroidsSensed, Time.time, getControlPose());
         publisherService.PublishListOfObstacleCentroids(obstacleTrackerService.GetConfirmedCircles(), trackedObstaclesRosTopic);
-        cbfService.SetObstacles(obstacleTrackerService.GetConfirmedCirclesWithVelocity());
-        if (recordPlotData) plotDataService.RecordObstacles(Time.time, obstacleTrackerService.GetConfirmedTracks());
+        cbfService.SetObstacles(mergeCloseRangeDetections(obstacleTrackerService.GetConfirmedCirclesWithVelocity(), obstaclesCentroidsSensed, getControlPose()));
+        publisherService.PublishListOfROSPoints3D(dynamicObstacleService.getLastUnexplainedPoints3D(), unexplainedPointsRosTopic);
+        if (recordPlotData)
+        {
+            plotDataService.RecordObstacles(Time.time, obstacleTrackerService.GetConfirmedTracks());
+            plotDataService.RecordDetection(Time.time, getControlPose(), dynamicObstacleService.getLastDetectionDiagnostics(), obstacleTrackerService.GetConfirmedTracks().Count);
+        }
         //foreach (ObstacleTrack t in obstacleTrackerService.GetConfirmedTracks())
         //    Debug.Log($"track {t.id}: pos=({t.cx:F2},{t.cy:F2}) r={t.r:F2} v=({t.vx:F2},{t.vy:F2}) age={t.age(Time.time):F1}s hits={t.hits}");
     }

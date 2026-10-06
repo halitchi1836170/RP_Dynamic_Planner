@@ -14,6 +14,9 @@ public class CBFService
     private float alphaStatic;
     private float gammaCLF;
     private float slackPenalty;
+    private float cbfSlackPenalty;      // molto maggiore: la sicurezza cede solo se non c'e' alternativa
+    private float commandSmoothingWeight;  // penalizza lo scostamento dalla soluzione PRECEDENTE del QP
+    private (double v, double w) lastSolution;
     private float vDeviationWeight;
     private float wDeviationWeight;
     private float staticActivationDistance;
@@ -21,16 +24,19 @@ public class CBFService
     private float gradientStepCells;
     private float activationTolerance;
     private float wMaxCBF;
+    private float robotBodyRadius;      // > 0 abilita una seconda barriera sul CENTRO del robot
 
     private float lastMinBarrier;     // h = |p_b - p_o|^2 - R^2  [m^2]
     private float lastMinMargin;      // dist - R  [m], stessa cosa ma leggibile
     private float lastStaticMargin;   // d(p_b) - rSafeStatic  [m]
+    private double lastCBFSlack;      // >0 = il QP ha dovuto rilassare una barriera
+    private double lastDeviation;     // |u - u_nom|: quanto il filtro sta DAVVERO correggendo
     private int lastConstraintCount;
 
     private DistanceMap distanceMap;
     private List<(float cx, float cy, float r, float vx, float vy)> obstacles;
 
-    public CBFService(float bLookAhead, float rSafeDynamic, float rSafeStatic, float alphaDynamic, float alphaStatic, float gammaCLF, float slackPenalty, float vDeviationWeight, float wDeviationWeight, float staticActivationDistance, float obstacleActivationRange, float gradientStepCells, float activationTolerance, float wMaxCBF)
+    public CBFService(float bLookAhead, float rSafeDynamic, float rSafeStatic, float alphaDynamic, float alphaStatic, float gammaCLF, float slackPenalty, float cbfSlackPenalty, float commandSmoothingWeight, float vDeviationWeight, float wDeviationWeight, float staticActivationDistance, float obstacleActivationRange, float gradientStepCells, float activationTolerance, float wMaxCBF, float robotBodyRadius)
     {
         this.bLookAhead = bLookAhead;
         this.rSafeDynamic = rSafeDynamic;
@@ -39,6 +45,8 @@ public class CBFService
         this.alphaStatic = alphaStatic;
         this.gammaCLF = gammaCLF;
         this.slackPenalty = slackPenalty;
+        this.cbfSlackPenalty = cbfSlackPenalty;
+        this.commandSmoothingWeight = commandSmoothingWeight;
         this.vDeviationWeight = vDeviationWeight;
         this.wDeviationWeight = wDeviationWeight;
         this.staticActivationDistance = staticActivationDistance;
@@ -46,6 +54,7 @@ public class CBFService
         this.gradientStepCells = gradientStepCells;
         this.activationTolerance = activationTolerance;
         this.wMaxCBF = wMaxCBF;
+        this.robotBodyRadius = robotBodyRadius;
         this.obstacles = new List<(float, float, float, float, float)>();
     }
 
@@ -77,34 +86,56 @@ public class CBFService
 
         addBoxConstraints(rows, values, vMax, wMaxCBF);
         addCLFConstraint(rows, values, terms, uNom);
-        addDynamicConstraints(rows, values, pbx, pby, cosT, sinT);
+        int rowsBeforeBarriers = rows.Count;
+        addDynamicConstraints(rows, values, pbx, pby, currentConfig.x, currentConfig.y, cosT, sinT);
         addStaticConstraint(rows, values, pbx, pby, cosT, sinT);
 
-        // pesi diversi su v e w: con wDeviationWeight < vDeviationWeight il QP preferisce sterzare che frenare
-        double[,] Q = new double[3, 3] { { vDeviationWeight, 0.0, 0.0 }, { 0.0, wDeviationWeight, 0.0 }, { 0.0, 0.0, slackPenalty } };
-        double[] d = new double[3] { -vDeviationWeight * uNom.v, -wDeviationWeight * uNom.w, 0.0 };
+        // La regolarizzazione serve solo quando una barriera e' in gioco: in spazio libero deve restare
+        // vero che la soluzione e' ESATTAMENTE il nominale.
+        double smoothing = rows.Count > rowsBeforeBarriers ? commandSmoothingWeight : 0.0;
 
-        double[,] A = new double[rows.Count, 3];
+        // pesi diversi su v e w: con wDeviationWeight < vDeviationWeight il QP preferisce sterzare che frenare
+        // Con due ostacoli il QP puo' alternare "sterza a destra" / "sterza a sinistra" fra un passo e
+        // l'altro: aggiungere un costo sullo scostamento dalla soluzione PRECEDENTE smorza il chattering
+        // alla fonte. A regime u_prev coincide con la soluzione, quindi non introduce errore.
+        double[,] Q = new double[4, 4] {
+            { vDeviationWeight + smoothing, 0.0, 0.0, 0.0 },
+            { 0.0, wDeviationWeight + smoothing, 0.0, 0.0 },
+            { 0.0, 0.0, slackPenalty, 0.0 },
+            { 0.0, 0.0, 0.0, cbfSlackPenalty } };
+        double[] d = new double[4] {
+            -(vDeviationWeight * uNom.v + smoothing * lastSolution.v),
+            -(wDeviationWeight * uNom.w + smoothing * lastSolution.w), 0.0, 0.0 };
+
+        double[,] A = new double[rows.Count, 4];
         double[] bVector = new double[rows.Count];
         for (int i = 0; i < rows.Count; i++)
         {
             A[i, 0] = rows[i][0];
             A[i, 1] = rows[i][1];
             A[i, 2] = rows[i][2];
+            A[i, 3] = rows[i][3];
             bVector[i] = values[i];
         }
 
         lastConstraintCount = rows.Count;
 
         GoldfarbIdnani solver = new GoldfarbIdnani(Q, d, A, bVector, 0);
-        if (!solver.Minimize()) return (0.0, 0.0, true, false);
+        if (!solver.Minimize())
+        {
+            lastCBFSlack = double.MaxValue;
+            return (0.0, 0.0, true, false);    // non dovrebbe piu' accadere: con gli slack il QP e' sempre risolvibile
+        }
 
         double vSolution = solver.Solution[0];
         double wSolution = solver.Solution[1];
+        lastCBFSlack = solver.Solution[3];
         if (double.IsNaN(vSolution) || double.IsInfinity(vSolution) || double.IsNaN(wSolution) || double.IsInfinity(wSolution))
             return (0.0, 0.0, true, false);
 
+        lastSolution = (vSolution, wSolution);
         double deviation = Math.Sqrt((vSolution - uNom.v) * (vSolution - uNom.v) + (wSolution - uNom.w) * (wSolution - uNom.w));
+        lastDeviation = deviation;
 
         return (vSolution, wSolution, deviation > activationTolerance, true);
     }
@@ -115,13 +146,25 @@ public class CBFService
         return (lastMinBarrier, lastMinMargin, lastStaticMargin, lastConstraintCount);
     }
 
+    // Quanto il QP ha dovuto rilassare le barriere: 0 = garanzia di sicurezza intatta.
+    public double getLastDeviation()
+    {
+        return lastDeviation;
+    }
+
+    public double getLastCBFSlack()
+    {
+        return lastCBFSlack;
+    }
+
     private void addBoxConstraints(List<double[]> rows, List<double> values, float vMax, float wMax)
     {
-        rows.Add(new double[3] { 1.0, 0.0, 0.0 }); values.Add(-vMax);
-        rows.Add(new double[3] { -1.0, 0.0, 0.0 }); values.Add(-vMax);
-        rows.Add(new double[3] { 0.0, 1.0, 0.0 }); values.Add(-wMax);
-        rows.Add(new double[3] { 0.0, -1.0, 0.0 }); values.Add(-wMax);
-        rows.Add(new double[3] { 0.0, 0.0, 1.0 }); values.Add(0.0);
+        rows.Add(new double[4] { 1.0, 0.0, 0.0, 0.0 }); values.Add(-vMax);
+        rows.Add(new double[4] { -1.0, 0.0, 0.0, 0.0 }); values.Add(-vMax);
+        rows.Add(new double[4] { 0.0, 1.0, 0.0, 0.0 }); values.Add(-wMax);
+        rows.Add(new double[4] { 0.0, -1.0, 0.0, 0.0 }); values.Add(-wMax);
+        rows.Add(new double[4] { 0.0, 0.0, 1.0, 0.0 }); values.Add(0.0);      // delta_clf >= 0
+        rows.Add(new double[4] { 0.0, 0.0, 0.0, 1.0 }); values.Add(0.0);      // s_cbf    >= 0
     }
 
     // V = k2/2 (e1^2 + e2^2) + e3^2/2,  Vdot = a0 - k2 e1 v - e3 w <= -gamma V + delta
@@ -134,12 +177,12 @@ public class CBFService
         double a0 = terms.k2 * terms.v_des * (terms.e1 * Mathf.Cos(terms.e3) + terms.e2 * Mathf.Sin(terms.e3)) + terms.e3 * terms.w_des;
         double nominalDecay = terms.k2 * terms.e1 * uNom.v + terms.e3 * uNom.w;
 
-        rows.Add(new double[3] { terms.k2 * terms.e1, terms.e3, 1.0 });
+        rows.Add(new double[4] { terms.k2 * terms.e1, terms.e3, 1.0, 0.0 });
         values.Add(Math.Min(gammaCLF * V + a0, nominalDecay));
     }
 
     // h = |p_b - p_o|^2 - R^2,  hdot = a_v v + a_w w - 2 (p_b - p_o) . v_o >= -alpha h
-    private void addDynamicConstraints(List<double[]> rows, List<double> values, float pbx, float pby, float cosT, float sinT)
+    private void addDynamicConstraints(List<double[]> rows, List<double> values, float pbx, float pby, float px, float py, float cosT, float sinT)
     {
         foreach ((float cx, float cy, float r, float vx, float vy) o in obstacles)
         {
@@ -155,8 +198,22 @@ public class CBFService
             double av = 2.0 * (dx * cosT + dy * sinT);
             double aw = 2.0 * bLookAhead * (-dx * sinT + dy * cosT);
 
-            rows.Add(new double[3] { av, aw, 0.0 });
+            rows.Add(new double[4] { av, aw, 0.0, 1.0 });
             values.Add(-alphaDynamic * h + 2.0 * (dx * o.vx + dy * o.vy));
+
+            // La barriera sul punto avanzato protegge p_b, non la scocca: nel caso peggiore il corpo
+            // resta scoperto di bLookAhead. Questa seconda riga e' scritta sul CENTRO del robot, dove
+            // h non dipende da theta: agisce solo su v, quindi e' una frenata di ultima istanza.
+            if (robotBodyRadius <= 0f) continue;
+
+            float bx = px - o.cx;
+            float by = py - o.cy;
+            float Rbody = o.r + robotBodyRadius;
+            float hBody = bx * bx + by * by - Rbody * Rbody;
+            if (hBody < lastMinBarrier) lastMinBarrier = hBody;
+
+            rows.Add(new double[4] { 2.0 * (bx * cosT + by * sinT), 0.0, 0.0, 1.0 });
+            values.Add(-alphaDynamic * hBody + 2.0 * (bx * o.vx + by * o.vy));
         }
     }
 
@@ -175,7 +232,7 @@ public class CBFService
         double av = field.gx * cosT + field.gy * sinT;
         double aw = bLookAhead * (-field.gx * sinT + field.gy * cosT);
 
-        rows.Add(new double[3] { av, aw, 0.0 });
+        rows.Add(new double[4] { av, aw, 0.0, 1.0 });
         values.Add(-alphaStatic * h);
     }
 

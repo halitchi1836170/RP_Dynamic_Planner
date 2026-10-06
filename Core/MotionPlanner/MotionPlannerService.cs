@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -33,9 +33,17 @@ public class MotionPlannerService
     private int secondsControlFrequency;
     private float wMax;   // cap di velocita' angolare per il rallentamento in curva del profilo (kappa*v <= wMax)
     private float aMax;   // accelerazione tangenziale per le rampe accel/decel del profilo
+    private float waypointRelaxClearance;  // clearance minima richiesta a un waypoint proiettato [m]
+    private float waypointRelaxRadius;     // entro quanto si cerca la cella libera piu' vicina [m]
+    private float startEscapeRadius;       // se il robot e' dentro un disco, gli si lascia una via d'uscita [m]
+    private bool lastGoalWasRelaxed;       // l'ultimo segmento ha dovuto spostare il waypoint?
+    private float collinearToleranceDeg;   // sotto questa deviazione un vertice non porta informazione
+    private float minVertexSpacing;        // vertici piu' vicini di cosi' infittiscono la spline senza servire
+    private (float x, float y) lastGoalWorld;              // dove e' finito davvero il goal del segmento
+    private List<(float, float)> effectiveWaypoints = new List<(float, float)>();   // quelli usati dal piano CORRENTE
     private float vMax;   // tetto di velocita' lineare: la crociera del profilo NON deve superarlo (== clamp del controller)
 
-    public MotionPlannerService(bool smoothTrajWithLoSPS, float epsilon, float linearMeanVelocity, (double vel_qi, double acc_qi) qiCouple, (double vel_qf, double acc_qf) qfCouple, int subSamplesPerSpline, int secondsControlFrequency, float wMax, float aMax, float vMax)
+    public MotionPlannerService(bool smoothTrajWithLoSPS, float epsilon, float linearMeanVelocity, (double vel_qi, double acc_qi) qiCouple, (double vel_qf, double acc_qf) qfCouple, int subSamplesPerSpline, int secondsControlFrequency, float wMax, float aMax, float vMax, float waypointRelaxClearance, float waypointRelaxRadius, float startEscapeRadius, float collinearToleranceDeg, float minVertexSpacing)
     {
         geometricIndexesTrajectoryToBeFollowed = new List<int>();
         geometricTrajectoryToBeFollowedWorld = new List<(float, float)>();
@@ -57,6 +65,50 @@ public class MotionPlannerService
         this.wMax = wMax;
         this.aMax = aMax;
         this.vMax = vMax;
+        this.waypointRelaxClearance = waypointRelaxClearance;
+        this.waypointRelaxRadius = waypointRelaxRadius;
+        this.startEscapeRadius = startEscapeRadius;
+        this.collinearToleranceDeg = collinearToleranceDeg;
+        this.minVertexSpacing = minVertexSpacing;
+    }
+
+    // Un waypoint della missione puo' finire DENTRO il disco di un ostacolo appena comparso: in quel
+    // caso la cella non viene mai espansa e A* dichiara "nessun percorso" anche quando il corridoio
+    // e' percorribile. Qui si cerca la cella libera piu' vicina: il punto raggiungibile che meno si
+    // discosta da quello nominale. Ritorna -1 se non ce n'e' nessuna entro il raggio di ricerca.
+    private int findNearestReachableIndex(DistanceMap distanceMap, int index, float minClearance)
+    {
+        float[] dmap = distanceMap.getDistanceMap();
+        float res = distanceMap.getResolution();
+
+        if (dmap[index] * res >= minClearance) return index;
+
+        (int cx, int cy) origin = distanceMap.getCellFromIndex(index);
+        int maxRing = Mathf.CeilToInt(waypointRelaxRadius / res);
+
+        for (int ring = 1; ring <= maxRing; ring++)
+        {
+            int best = -1;
+            float bestClearance = 0f;
+            for (int dy = -ring; dy <= ring; dy++)
+            {
+                for (int dx = -ring; dx <= ring; dx++)
+                {
+                    if (Mathf.Max(Mathf.Abs(dx), Mathf.Abs(dy)) != ring) continue;   // solo il bordo dell'anello
+                    (int cx, int cy) cell = (origin.cx + dx, origin.cy + dy);
+                    if (!distanceMap.cellInMap(cell)) continue;
+
+                    float clearance = dmap[distanceMap.getIndexFromCell(cell)] * res;
+                    if (clearance >= minClearance && clearance > bestClearance)
+                    {
+                        bestClearance = clearance;
+                        best = distanceMap.getIndexFromCell(cell);
+                    }
+                }
+            }
+            if (best >= 0) return best;     // primo anello utile = cella piu' vicina al waypoint nominale
+        }
+        return -1;
     }
 
     public void DetermineGeometricTrajectory(DistanceMap distanceMap, (float startXUnity, float startZUnity) start, (float goalXUnity, float goalZUnity) goal, Planner plannerMode)
@@ -78,18 +130,35 @@ public class MotionPlannerService
 
     // Trajectory attraverso una lista ORDINATA di waypoint (start, nodi intermedi, goal): A* su OGNI intervallo,
     // concatenato in un'unica trajectory geometrica (senza duplicare il nodo condiviso), poi LOS-PS come al solito.
-    public void DetermineGeometricTrajectoryFromWaypoints(DistanceMap distanceMap, List<(float, float)> waypoints, Planner plannerMode)
+    public bool DetermineGeometricTrajectoryFromWaypoints(DistanceMap distanceMap, List<(float, float)> waypoints, Planner plannerMode)
     {
         this.distanceMap = distanceMap;
+
+        effectiveWaypoints = new List<(float, float)>();
+        if (waypoints.Count > 0) effectiveWaypoints.Add(waypoints[0]);
 
         List<int> fullPath = new List<int>();
         List<(float, float)> fullPathWorld = new List<(float, float)>();
         forcedWaypointIndices.Clear();
 
+        // Il segmento successivo deve partire da DOVE SI E' ARRIVATI, non dal waypoint nominale:
+        // se il goal e' stato rilassato i due punti differiscono, e ripartire dal nominale (che sta
+        // dentro l'ostacolo) spezzava la polilinea con un salto, poi splinato in una curva assurda.
+        (float, float) segmentStart = waypoints[0];
+
         for (int i = 0; i + 1 < waypoints.Count; i++)
         {
             (List<int> path, List<(float, float)> pathWorld) seg = (new List<int>(), new List<(float, float)>());
-            if (plannerMode == Planner.A) seg = planSegmentWithA(distanceMap, waypoints[i], waypoints[i + 1]);
+            if (plannerMode == Planner.A) seg = planSegmentWithA(distanceMap, segmentStart, waypoints[i + 1]);
+
+            segmentStart = lastGoalWorld;
+            effectiveWaypoints.Add(lastGoalWorld);
+
+            if (seg.pathWorld.Count == 0)
+            {
+                Debug.LogWarning($"A* fallito sul segmento {i}: -> ({waypoints[i + 1].Item1:F2},{waypoints[i + 1].Item2:F2})");
+                return false;
+            }
 
             int startIdx = (i == 0) ? 0 : 1;   // salto il primo punto (== ultimo del segmento precedente) per non duplicare il nodo
             for (int j = startIdx; j < seg.pathWorld.Count; j++)
@@ -100,12 +169,27 @@ public class MotionPlannerService
 
             // l'ultimo punto appena aggiunto e' il nodo waypoint[i+1]: lo forzo se INTERMEDIO (start = indice 0
             // e goal = ultimo punto sono comunque sempre tenuti dal LOS-PS). Traccio l'INDICE, non le coordinate.
-            if (i + 1 < waypoints.Count - 1) forcedWaypointIndices.Add(fullPathWorld.Count - 1);
+            // Un waypoint SPOSTATO non e' piu' un punto di passaggio voluto: forzarlo come vertice
+            // del LOS-PS creerebbe un gomito artificiale e un percorso spezzato.
+            if (i + 1 < waypoints.Count - 1 && !lastGoalWasRelaxed) forcedWaypointIndices.Add(fullPathWorld.Count - 1);
         }
+
+        if (fullPathWorld.Count < 2) return false;
 
         setPlannedGeometricTrajectory(fullPath, fullPathWorld);
 
-        if (smoothTrajWithLoSPS) smoothGeometricTrajectoryWithLOSPS();
+        if (smoothTrajWithLoSPS)
+        {
+            smoothGeometricTrajectoryWithLOSPS();
+            smoothGeometricTrajectoryToBeFollowedWorld = simplifyNearCollinearVertices(smoothGeometricTrajectoryToBeFollowedWorld);
+            int before = smoothGeometricTrajectoryToBeFollowedWorld.Count;
+            smoothGeometricTrajectoryToBeFollowedWorld = removeTooCloseConsecutivePoints(smoothGeometricTrajectoryToBeFollowedWorld);
+            if (smoothGeometricTrajectoryToBeFollowedWorld.Count != before)
+                Debug.Log($"LOS-PS: rimossi {before - smoothGeometricTrajectoryToBeFollowedWorld.Count} vertici coincidenti");
+        }
+
+        // la spline ha bisogno di almeno 3 nodi: con meno, meglio dichiarare fallimento che eccepire
+        return getGeometricTrajectoryToBeUsed().Count >= 3;
     }
 
     private (List<int> path, List<(float, float)> pathWorld) planSegmentWithA(DistanceMap distanceMap, (float startXUnity, float startZUnity) start, (float goalXUnity, float goalZUnity) goal)
@@ -122,6 +206,20 @@ public class MotionPlannerService
 
         int startIndex = distanceMap.getIndexFromWorldPosition(start);
         int goalIndex = distanceMap.getIndexFromWorldPosition(goal);
+
+        lastGoalWasRelaxed = false;
+        int relaxedGoal = findNearestReachableIndex(distanceMap, goalIndex, waypointRelaxClearance);
+        if (relaxedGoal < 0) return (new List<int>(), new List<(float, float)>());
+        if (relaxedGoal != goalIndex)
+        {
+            (int gx, int gy) a = distanceMap.getCellFromIndex(goalIndex);
+            (int gx, int gy) b = distanceMap.getCellFromIndex(relaxedGoal);
+            Debug.Log($"Waypoint rilassato di {Mathf.Sqrt((a.gx - b.gx) * (a.gx - b.gx) + (a.gy - b.gy) * (a.gy - b.gy)) * distanceMap.getResolution():F2} m: era dentro un ostacolo");
+            goalIndex = relaxedGoal;
+            lastGoalWasRelaxed = true;
+        }
+        lastGoalWorld = distanceMap.getWorldFromIndex(goalIndex);
+
         costMap[startIndex] = 0f;
         Q.Enqueue(startIndex, costMap[startIndex] + distanceMap.getHeuristicDistanceFromGoal(startIndex, goalIndex));
 
@@ -144,7 +242,9 @@ public class MotionPlannerService
             foreach( ((int nX, int nY), float dist) neighbor in uNeighbors)
             {
                 int v_index = distanceMap.getIndexFromCell(neighbor.Item1);
-                if (distanceMapArr[v_index] == 0) continue;        //vuol dire che è un ostacolo
+                // Normalmente le celle occupate non si attraversano, ma se il robot si trova lui stesso
+                // dentro un disco gonfiato resterebbe intrappolato: entro startEscapeRadius lo si lascia uscire.
+                if (distanceMapArr[v_index] == 0 && !isWithinEscapeRadius(distanceMap, startIndex, v_index)) continue;
                 float transitionCost = neighbor.dist + k / (distanceMapArr[v_index]+eps);
                 float tentative = costMap[u_index] + transitionCost;
                 if(tentative < costMap[v_index])
@@ -157,6 +257,14 @@ public class MotionPlannerService
             }
         }
         return (new List<int>(), new List<(float, float)>());   // nessun percorso trovato
+    }
+
+    private bool isWithinEscapeRadius(DistanceMap distanceMap, int startIndex, int index)
+    {
+        (int sx, int sy) s = distanceMap.getCellFromIndex(startIndex);
+        (int cx, int cy) c = distanceMap.getCellFromIndex(index);
+        float cells = startEscapeRadius / distanceMap.getResolution();
+        return (s.sx - c.cx) * (s.sx - c.cx) + (s.sy - c.cy) * (s.sy - c.cy) <= cells * cells;
     }
 
     // Line-of-Sight Path Smoothing (string-pulling): parte dal path grezzo di A* (spezzata a scaletta,
@@ -198,6 +306,59 @@ public class MotionPlannerService
         smoothGeometricTrajectoryToBeFollowedWorld.Add(geometricTrajectoryToBeFollowedWorld[n - 1]);
     }
 
+    // Il LOS-PS e' una semplificazione greedy e lascia vertici quasi allineati, che diventano nodi
+    // spline inutili e rendono il percorso ondulato. Qui si rimuovono quelli con deviazione angolare
+    // trascurabile, ma SOLO se i vicini continuano a vedersi dentro il tunnel di sicurezza: cosi' la
+    // semplificazione non puo' tagliare un angolo verso un ostacolo.
+    private List<(float, float)> simplifyNearCollinearVertices(List<(float, float)> points)
+    {
+        if (points.Count < 3) return points;
+
+        List<(float, float)> kept = new List<(float, float)>();
+        kept.Add(points[0]);
+
+        for (int i = 1; i < points.Count - 1; i++)
+        {
+            (float x, float y) previous = kept[kept.Count - 1];
+            (float x, float y) current = points[i];
+            (float x, float y) next = points[i + 1];
+
+            float a1 = Mathf.Atan2(current.y - previous.y, current.x - previous.x);
+            float a2 = Mathf.Atan2(next.y - current.y, next.x - current.x);
+            float turn = Mathf.Abs(Mathf.Rad2Deg * Mathf.Atan2(Mathf.Sin(a2 - a1), Mathf.Cos(a2 - a1)));
+
+            if (turn < collinearToleranceDeg && lineOfSightClear(previous, next)) continue;   // vertice superfluo
+            kept.Add(current);
+        }
+
+        kept.Add(points[points.Count - 1]);
+        return kept;
+    }
+
+    // Due vertici coincidenti annullano un intervallo temporale e fanno divergere la spline (1/dt).
+    private List<(float, float)> removeTooCloseConsecutivePoints(List<(float, float)> points)
+    {
+        float minSpacing = Mathf.Max(minVertexSpacing, 0.5f * distanceMap.getResolution());
+        List<(float, float)> cleaned = new List<(float, float)>();
+
+        foreach ((float x, float y) p in points)
+        {
+            if (cleaned.Count > 0)
+            {
+                float dx = p.x - cleaned[cleaned.Count - 1].Item1;
+                float dy = p.y - cleaned[cleaned.Count - 1].Item2;
+                if (Mathf.Sqrt(dx * dx + dy * dy) < minSpacing) continue;
+            }
+            cleaned.Add(p);
+        }
+
+        // l'ultimo punto e' il goal: se e' stato scartato perche' troppo vicino, lo rimetto al posto del penultimo
+        if (points.Count > 0 && cleaned.Count > 0 && cleaned[cleaned.Count - 1] != points[points.Count - 1])
+            cleaned[cleaned.Count - 1] = points[points.Count - 1];
+
+        return cleaned;
+    }
+
     // Il segmento a->b (coordinate mondo ROS) e' percorribile se, campionandolo, ogni campione resta ad almeno
     // epsilon dall'ostacolo piu' vicino. La distance map fornisce la distanza in celle: * resolution -> metri.
     private bool lineOfSightClear((float x, float y) a, (float x, float y) b)
@@ -228,6 +389,31 @@ public class MotionPlannerService
             if (clearanceMeters < epsilon) return false;                // il tunnel toccherebbe un ostacolo
         }
         return true;
+    }
+
+    // Azzera TUTTO lo stato accumulato: senza questo un secondo piano si somma al primo
+    // (le liste fanno solo Add) e i flag farebbero restituire la tabella vecchia.
+    public void Reset()
+    {
+        geometricIndexesTrajectoryToBeFollowed = new List<int>();
+        geometricTrajectoryToBeFollowedWorld = new List<(float, float)>();
+        smoothGeometricTrajectoryToBeFollowedWorld = new List<(float, float)>();
+        geomtricTrajecotryFromSplinesToBeFollowed = new List<(float, float)>();
+        geometricTrajectoryTableForController = new List<(float t, float x, float y, float xd, float yd, float xdd, float ydd)>();
+        coefficients_xSpline = new List<(double, double, double, double, double, double)>();
+        coefficients_ySpline = new List<(double, double, double, double, double, double)>();
+        forcedWaypointIndices.Clear();
+        effectiveWaypoints = new List<(float, float)>();
+        geometricTrajectoryDetermined = false;
+        splinedGeometricTrajectoryDetermined = false;
+        controllerGeometricTrajectoryDetermined = false;
+    }
+
+    // I waypoint che il piano CORRENTE sta davvero inseguendo: residui della missione, con quelli
+    // caduti dentro un ostacolo gia' proiettati sulla cella libera piu' vicina.
+    public List<(float, float)> getEffectiveWaypoints()
+    {
+        return effectiveWaypoints;
     }
 
     public bool GeometricTrajectoryDetermined()
@@ -547,6 +733,35 @@ public class MotionPlannerService
     public List<(float, float)> getSplinedGeomtricTrajectory()
     {
         return this.geomtricTrajecotryFromSplinesToBeFollowed;
+    }
+
+    // Ultima linea di difesa: qualunque degenerazione geometrica sfugga ai controlli a monte,
+    // una tabella con NaN non deve MAI raggiungere il controller (il QP riceverebbe NaN e fallirebbe).
+    // Diagnostica: la spline diverge quando due vertici consecutivi sono troppo vicini (dt -> 0).
+    public float getMinConsecutiveSpacing()
+    {
+        List<(float, float)> pts = getGeometricTrajectoryToBeUsed();
+        float best = float.MaxValue;
+        for (int i = 1; i < pts.Count; i++)
+        {
+            float dx = pts[i].Item1 - pts[i - 1].Item1;
+            float dy = pts[i].Item2 - pts[i - 1].Item2;
+            float d = Mathf.Sqrt(dx * dx + dy * dy);
+            if (d < best) best = d;
+        }
+        return pts.Count < 2 ? 0f : best;
+    }
+
+    public bool ControllerTrajectoryIsFinite()
+    {
+        if (geometricTrajectoryTableForController.Count < 2) return false;
+
+        foreach ((float t, float x, float y, float xd, float yd, float xdd, float ydd) row in geometricTrajectoryTableForController)
+        {
+            if (float.IsNaN(row.x) || float.IsInfinity(row.x) || float.IsNaN(row.y) || float.IsInfinity(row.y) ||
+                float.IsNaN(row.xd) || float.IsInfinity(row.xd) || float.IsNaN(row.yd) || float.IsInfinity(row.yd)) return false;
+        }
+        return true;
     }
 
     public List<(float t, float x, float y, float xd, float yd, float xdd, float ydd)> getGeometricTrajectoryForController()

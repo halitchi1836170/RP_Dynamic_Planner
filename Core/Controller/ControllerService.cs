@@ -11,7 +11,9 @@ public class ControllerService
     private ControlStrategy controlStrategy;
     private List<(float tl, float x, float y, float dx, float dy, float ddx, float ddyt)> geometricTrajectoryTable;
     private int iter;
+    private float referenceTime;   // tempo percorso sulla traiettoria, indipendente dal rate del loop
     private bool controllerActive;
+    private bool trajectoryCompleted;   // vero SOLO a riferimento esaurito: Disarm non e' una conclusione
     private float lastControl;
     private (ArticulationBody leftWheel, ArticulationBody rightWheel) wheelBodies;
     private float wheelRadius;
@@ -25,6 +27,7 @@ public class ControllerService
     private float referenceMaxLag;
     private float maxLinearAccelCommand;
     private float maxAngularAccelCommand;
+    private (float wl, float wr) lastWheelCommand;
     private double lastCommandedV;
     private double lastCommandedW;
     private (double v, double w) lastNominalControl;
@@ -39,6 +42,7 @@ public class ControllerService
         this.controlStrategy = controlStrategy;
         this.geometricTrajectoryTable = new List<(float tl, float x, float y, float dx, float dy, float ddx, float ddyt)>();
         this.iter = 0;
+        this.referenceTime = 0f;
         this.controllerActive = false;
         this.lastControl = Time.time;
         this.wheelBodies = wheelBodies;
@@ -194,30 +198,55 @@ public class ControllerService
         if(iter >= geometricTrajectoryTable.Count)
         {
             Debug.Log("Traiettoria completata");
+            trajectoryCompleted = true;
             controllerActive = false;
             return (0,0);
         }
-        (double v, double w) controlInput = applyRateLimit(getControlInput(iter, currentConfig));
-        if (getReferenceLag(iter, currentConfig) < referenceMaxLag) iter += 1;   // il riferimento aspetta solo se il robot e' rimasto indietro
+        // Tempo REALE fra due passi di controllo: il loop gira al rate di Update (spesso 5-10 Hz con
+        // LiDAR e ICP attivi), non ai secondsControlFrequency nominali.
+        float dt = Mathf.Clamp(Time.time - lastControl, 0f, 0.5f);
+
+        (double v, double w) controlInput = applyRateLimit(getControlInput(iter, currentConfig), dt);
+        if (getReferenceLag(iter, currentConfig) < referenceMaxLag) advanceReference(dt);   // il riferimento aspetta solo se il robot e' rimasto indietro
         updateCBFActiveTime();
         lastControl = Time.time;
         return controlInput;
+    }
+
+    // Il riferimento scorre col TEMPO, non di una riga per chiamata: la tabella e' campionata a
+    // 1/secondsControlFrequency, quindi avanzare di una riga a ogni passo con il loop piu' lento
+    // faceva scorrere la traiettoria a una frazione della sua velocita' e il robot la superava.
+    private void advanceReference(float dt)
+    {
+        referenceTime += dt;
+
+        while (iter + 1 < geometricTrajectoryTable.Count && geometricTrajectoryTable[iter + 1].tl <= referenceTime) iter += 1;
+
+        if (iter == geometricTrajectoryTable.Count - 1 && referenceTime > geometricTrajectoryTable[iter].tl)
+            iter = geometricTrajectoryTable.Count;
     }
 
     public void Arm(List<(float t, float x, float y, float xd, float yd, float xdd, float ydd)> list)
     {
         this.geometricTrajectoryTable = list;
         this.iter = 0;
+        this.referenceTime = 0f;
+        this.trajectoryCompleted = false;
         this.controllerActive = true;
+        this.lastControl = Time.time;
         this.lastCommandedV = 0.0;
         this.lastCommandedW = 0.0;
     }
 
     // Il QP puo cambiare il punto di lavoro di colpo quando cambia l'insieme dei vincoli attivi: senza
     // questo limite il comando e discontinuo e la rotazione brusca fa divergere l'ICP di localizzazione.
-    private (double v, double w) applyRateLimit((double v, double w) controlInput)
+    private (double v, double w) applyRateLimit((double v, double w) controlInput, float elapsed)
     {
-        double dt = 1.0 / secondsControlFrequency;
+        // Math.Clamp propaga NaN: senza questa guardia lastCommanded resterebbe NaN per sempre.
+        if (double.IsNaN(controlInput.v) || double.IsInfinity(controlInput.v)) controlInput.v = 0.0;
+        if (double.IsNaN(controlInput.w) || double.IsInfinity(controlInput.w)) controlInput.w = 0.0;
+
+        double dt = elapsed > 1e-4f ? elapsed : 1.0 / secondsControlFrequency;
         double maxDeltaV = maxLinearAccelCommand * dt;
         double maxDeltaW = maxAngularAccelCommand * dt;
 
@@ -240,6 +269,12 @@ public class ControllerService
         else if (cbfActiveSince < 0f) cbfActiveSince = Time.time;
     }
 
+    // Comando di ruota in rad/s: confrontato con jointVelocity dice se il drive insegue davvero il target.
+    public (float wl, float wr) getLastWheelCommand()
+    {
+        return lastWheelCommand;
+    }
+
     public (double v, double w) getLastNominalControl()
     {
         return lastNominalControl;
@@ -255,9 +290,20 @@ public class ControllerService
         return lastTrackingTerms;
     }
 
+    public bool isTrajectoryCompleted()
+    {
+        return trajectoryCompleted;
+    }
+
     public bool isControllerActive()
     {
         return controllerActive;
+    }
+
+    // Quanto il filtro sta correggendo, non solo SE sta correggendo: `cbfActive` scatta gia' a 1e-3.
+    public double getLastCBFDeviation()
+    {
+        return cbfService != null ? cbfService.getLastDeviation() : 0.0;
     }
 
     public bool isCBFActive()
@@ -268,6 +314,38 @@ public class ControllerService
     public float getCBFActiveTime()
     {
         return cbfActiveSince < 0f ? 0f : Time.time - cbfActiveSince;
+    }
+
+    // Riprende il piano precedente dal punto in cui era: Disarm non tocca tabella e iter.
+    public void ReArm()
+    {
+        if (geometricTrajectoryTable.Count > 0 && iter < geometricTrajectoryTable.Count) this.controllerActive = true;
+    }
+
+    public void Disarm()
+    {
+        this.controllerActive = false;
+        this.lastCommandedV = 0.0;
+        this.lastCommandedW = 0.0;
+        this.cbfActive = false;
+        this.cbfActiveSince = -1f;
+    }
+
+    // Avanzamento lungo il riferimento: serve al rilevamento di stallo del replanner.
+    public int getReferenceIndex()
+    {
+        return iter;
+    }
+
+    public (float x, float y) getReferencePoint()
+    {
+        if (iter >= geometricTrajectoryTable.Count) return (0f, 0f);
+        return (geometricTrajectoryTable[iter].x, geometricTrajectoryTable[iter].y);
+    }
+
+    public List<(float t, float x, float y, float xd, float yd, float xdd, float ydd)> getTrajectoryTable()
+    {
+        return geometricTrajectoryTable;
     }
 
     public bool isTimeToControl()
@@ -283,6 +361,7 @@ public class ControllerService
             double.IsNaN(feedbackControl.w) || double.IsInfinity(feedbackControl.w)) return;
 
         (float wl, float wr) wheelsCommand = GetInverseAngularVelocities(wheelSeparation, wheelRadius, (float) feedbackControl.v, (float) feedbackControl.w);
+        lastWheelCommand = wheelsCommand;
         SetDriveTargetVelocity(wheelBodies.leftWheel, wheelsCommand.wl);
         SetDriveTargetVelocity(wheelBodies.rightWheel, wheelsCommand.wr);
     }
