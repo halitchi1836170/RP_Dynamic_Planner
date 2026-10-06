@@ -220,6 +220,12 @@ public class DistanceMap
         return cell.cellY * W + cell.cellX;
     }
 
+    public (float x, float y) getWorldFromIndex(int index)
+    {
+        (int cx, int cy) cell = getCellFromIndex(index);
+        return ((float)(originX + (cell.cx + 0.5) * resolution), (float)(originY + (cell.cy + 0.5) * resolution));
+    }
+
     public (int x, int y) getCellFromIndex(int index)
     {
         return ((int)index % W, (int) index/W);
