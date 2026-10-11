@@ -46,6 +46,7 @@ public class Orchestrator : MonoBehaviour
     public string currentPoseDebugRosTopic = "/debug/current_pose";   // posa corrente (odometria di ruota) in frame ROS
     public string truePoseDebugRosTopic = "/debug/true_pose";         // posa VERA (transform live -> ROS), solo debug
     public string icpPoseLocalizationDebugRosTopic = "/debug/localization/icp_pose";
+    public string localizedPoseRosTopic = "/localized_pose";
     public string dynamicObstaclesRosTopic = "/debug/dynamic_obstacles";
     public string trackedObstaclesRosTopic = "/debug/tracked_obstacles";
     public string unexplainedPointsRosTopic = "/debug/unexplained_points";
@@ -351,6 +352,7 @@ public class Orchestrator : MonoBehaviour
         //------------------REGISTRAZIONE PUBLISHER
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PathMsg>(icpPathRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PointCloud2Msg>(icpMapRosTopic);
+        ROSConnection.GetOrCreateInstance().RegisterPublisher<OdometryMsg>(localizedPoseRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<OdometryMsg>(odometryRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<PathMsg>(odometryPathRosTopic);
         ROSConnection.GetOrCreateInstance().RegisterPublisher<TFMessageMsg>(tfRosTopic);
@@ -536,6 +538,7 @@ public class Orchestrator : MonoBehaviour
             (float lx, float ly, float lth, bool accepted) = localizationService.Step(odometryService.getUpdatedConfiguration());
             icpLocalizedConfig = (lx, ly, lth);
             publisherService.PublishDebugPoint((lx, ly), icpPoseLocalizationDebugRosTopic);
+            publisherService.PublishLastOdometry(icpLocalizedConfig, localizedPoseRosTopic);
             lastLocalization = Time.time;
         }
 

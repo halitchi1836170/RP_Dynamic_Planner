@@ -1,0 +1,161 @@
+marrtino_nav:
+  ros__parameters:
+
+    # =====================================================================
+    #  Corrisponde ai campi pubblici di Orchestrator.cs, portati in C++.
+    #  I parametri governati da VELOCITA' e ACCELERAZIONE sono marcati nei
+    #  commenti con VELOCITA' / ACCELERAZIONE.
+    # =====================================================================
+
+    # --- Mappa e missione ----------------------------------------------
+    map_yaml: "C:/Users/halit/Desktop/ANDREI/UNI/AIRO/RP/Project/occupancyGridMap.yaml"
+    frame_id: "odom"
+    pose_topic: "/localized_pose"
+    mirror_odometry: true       # vale solo per /odometry, non per la posa localizzata
+    flip_omega: true            # Unity ha il verso di rotazione invertito
+
+    auto_plan: true
+    goal_x: 3.2
+    goal_y: -0.8
+    waypoints_x: [-2.175, -0.748,  1.670,  3.400,  2.310,  0.610, -2.590, -2.590,  2.800]
+    waypoints_y: [-1.389, -1.669, -2.080,  0.250,  1.400,  0.920,  0.150,  2.550,  3.590]
+
+    # --- Livelli reattivi, indipendenti --------------------------------
+    detection_enabled: true
+    cbf_enabled: true
+    replanning_enabled: true
+    max_futile_replans: 3        # ripianificazioni con lo stesso trigger e senza progresso
+    futile_replan_progress: 0.30 # [m] sotto cui il replan si considera inutile
+    diagnostics_period: 2.0
+
+    # Registrazione per tools/plot_run.py. Stessa cartella dei run C#, cosi' le
+    # figure dei due stack stanno insieme e si confrontano.
+    record_plot_data: true
+    plot_sample_period: 0.05
+    plot_dir: "C:/Users/halit/AppData/LocalLow/DefaultCompany/Ambulatorio_Robotico/plots"
+
+    # =====================================================================
+    #  PARAMETRI FONDAMENTALI
+    #  Sono questi i dieci che si toccano. Gli altri, marcati [DERIVATO],
+    #  vengono ricalcolati dal nodo a partire da questi quando
+    #  derive_parameters e' true, e i valori scritti sotto vengono ignorati.
+    # =====================================================================
+    derive_parameters: true
+
+    robot_body_radius: 0.23      # [m] raggio circoscritto della scocca
+    b_look_ahead: 0.15           # [m] punto avanzato del filtro
+    safety_margin: 0.0           # [m] margine OLTRE il minimo geometrico
+    cruise_speed: 0.08           # [m/s] velocita' di crociera
+    v_max: 0.12                   # [m/s] velocita' lineare massima
+    a_max: 0.07                  # [m/s^2] accelerazione del profilo
+    omega_nominal: 0.5           # [rad/s] tetto di curvatura del profilo
+    b: 6.0                       # guadagno del controllore (k2 = b)
+    zeta: 0.9                    # smorzamento (1.0 = critico)
+    control_period: 0.05         # [s]
+
+    # --- Fattori delle derivazioni (raramente da toccare) ----------------
+    cbf_omega_factor: 1.125      # w_max_cbf   = omega_nominal * questo
+    clamp_omega_factor: 1.5      # omega_max   = omega_nominal * questo
+    omega_slew_time: 0.8         # [s] per andare da 0 a omega_max  <-- morbidezza della sterzata
+    v_slew_time: 0.67            # [s] per andare da 0 a v_max
+    lag_safety_factor: 2.0       # reference_max_lag = questo * 1/(2*zeta*sqrt(b))
+    v_min_fraction: 0.625        # v_min = questo * cruise_speed
+    path_clearance_margin: 0.02  # [m] margine del percorso OLTRE il raggio della scocca
+
+    # --- A* - pianificazione globale -----------------------------------
+    astar_repulsion_gain: 50.0                 # k: penalita' di prossimita' nel costo A*
+    astar_epsilon: 0.01                        # evita la divisione per zero
+    start_escape_radius: 0.5                   # [m] se il robot e' dentro un disco, puo' uscirne
+    waypoint_relax_clearance: 0.20             # [m] clearance richiesta a un waypoint spostato
+    waypoint_relax_radius: 1.2                 # [m] entro quanto cercare la cella libera
+
+    # --- Smoothing del percorso ----------------------------------------
+    tunnel_half_width: 0.25                    # [DERIVATO] = robot_body_radius + path_clearance_margin
+    collinear_tolerance_deg: 10.0              # [deg] sotto questa svolta il vertice si scarta
+    min_vertex_spacing: 0.12                   # [m] vertici piu' vicini vengono fusi
+
+    # --- Spline --------------------------------------------------------
+    samples_per_segment: 30                    # campioni per intervallo di spline
+
+    # --- Profilo di velocita' ------------------------------------------
+    v_min: 0.05                                # [DERIVATO] pavimento del profilo [m/s]
+    profile_omega_max: 0.8                     # [DERIVATO] VELOCITA' angolare: tetto di curvatura [rad/s]
+
+    # --- Controllore di inseguimento -----------------------------------
+    omega_max: 1.2                             # [DERIVATO] VELOCITA' angolare: saturazione del controllore [rad/s]
+    max_linear_accel: 0.3                      # [DERIVATO] ACCELERAZIONE: limite di slew su v [m/s^2]
+    max_angular_accel: 1.0                     # [DERIVATO] ACCELERAZIONE: limite di slew su omega [rad/s^2]
+    reference_max_lag: 0.20                    # [DERIVATO] [m] oltre questo ritardo il riferimento aspetta
+    goal_tolerance: 0.10                       # [m] raggio di arrivo
+
+    # --- Filtro di sicurezza CBF ---------------------------------------
+    r_safe_dynamic: 0.42                       # [DERIVATO] [m] raggio di sicurezza sugli ostacoli
+    r_safe_static: 0.18                        # [DERIVATO] [m] raggio di sicurezza sulla mappa
+    alpha_dynamic: 0.8                         # piu' BASSO = reagisce da piu' lontano
+    alpha_static: 0.8                          # idem, sulla mappa
+    gamma_clf: 0.5                             # tasso di contrazione della CLF
+    slack_penalty: 100.0                       # penalita' sullo slack della CLF
+    cbf_slack_penalty: 10000.0                 # penalita' sullo slack della BARRIERA
+    command_smoothing_weight: 2.0              # ACCELERAZIONE: penalizza lo scarto dalla soluzione QP precedente
+    v_deviation_weight: 1.0                    # costo di deviare da v nominale
+    w_deviation_weight: 0.2                    # costo di deviare da omega nominale: piu' basso = sterza invece di frenare
+    static_activation_distance: 1.0            # [m] entro quanto la barriera statica si attiva
+    obstacle_activation_range: 3.0             # [m] entro quanto un ostacolo entra nel QP
+    gradient_step_cells: 1.0                   # passo per il gradiente della EDT
+    activation_tolerance: 0.001                # soglia sotto cui il filtro si dice inattivo
+    w_max_cbf: 0.9                             # [DERIVATO] VELOCITA' angolare: box del QP [rad/s]
+
+    # --- Detection ostacoli --------------------------------------------
+    detection_voxel_size: 0.05                 # [m]
+    self_hit_radius: 0.28                      # [m] usato solo se use_chassis_footprint = false
+    obs_tol: 0.12                              # [m] tolleranza 'spiegato dalla mappa' a distanza zero
+    obs_tol_per_meter: 0.02                    # [m/m] e la sua crescita col range
+    max_detection_range: 3.5                   # [m]
+    obstacle_z_min: 0.15                       # [m] banda di quota assoluta
+    obstacle_z_max: 1.0                        # [m]
+    max_elevation_deg: 12.0                    # [deg] gate asimmetrico: solo verso l'alto
+    clustering_radius: 0.3                     # [m] cella del grid-hash
+    min_cluster_points: 4
+    min_cluster_points_near: 2                 # soglia rilassata da vicino
+    near_cluster_range: 1.5                    # [m] entro cui vale la soglia rilassata
+    cluster_margin: 0.05                       # [m] margine sul raggio del cerchio
+    max_unexplained_fraction: 0.5              # oltre questa frazione la posa e' sospetta
+    min_suspicious_spread: 2.0                 # [m] ...e solo se i punti sono sparsi
+    laser_height: 0.335                        # [m] quota del laser sul pavimento
+    use_chassis_footprint: true                # sagoma rettangolare invece del cerchio
+    chassis_front: 0.04                        # [m]
+    chassis_rear: 0.24                         # [m]
+    chassis_half_width: 0.19                   # [m]
+    chassis_top_rel_laser: -0.125              # [m] tetto scocca rispetto al laser
+    chassis_margin: 0.04                       # [m]
+
+    # --- Tracking ostacoli ---------------------------------------------
+    track_gate: 0.5                            # [m] associazione detection-track
+    track_alpha_lowpass: 0.3                   # filtro sulla velocita' stimata
+    track_v_deadzone: 0.05                     # [m/s] sotto cui la velocita' e' zero
+    track_min_hits: 3                          # conferme richieste
+    track_forget_time: 1.0                     # [s] senza rilevamenti
+    blind_zone_radius: 0.7                     # [m] entro cui il sensore non vede
+    blind_zone_forget_factor: 6.0              # in zona cieca il track vive tanto di piu'
+    blind_zone_growth_rate: 0.05               # [m/s] crescita del raggio in zona cieca
+    max_blind_growth: 0.2                      # [m] tetto a quella crescita
+    radius_decay_per_update: 0.98              # decadimento del massimo storico
+    min_points_for_update: 4                   # sotto cui il cluster non sposta il track
+
+    # --- Replanning ----------------------------------------------------
+    persistent_obstacle_age: 1.0               # [s] eta' oltre cui un track conta
+    replan_look_ahead_distance: 2.0            # [m] quanto riferimento guardare avanti
+    obstacle_inflation_margin: 0.25            # [m] gonfiaggio in ripianificazione
+    reduced_inflation_factor: 0.5              # fattore al secondo tentativo
+    stall_window: 4.0                          # [s]
+    stall_min_progress: 0.15                   # [m] in quella finestra
+    replan_max_deviation: 0.6                  # [m]
+    deviation_window: 1.5                      # [s]
+    max_infeasible_steps: 5                    # QP falliti consecutivi
+    min_cbf_engagement: 1.5                    # [s] ingaggio minimo del filtro
+    engagement_margin_threshold: 0.4           # [m] ...e ostacolo entro questo margine
+    engagement_deviation_threshold: 0.04       # ...e correzione almeno di tanto
+    min_replan_interval: 10.0                  # [s] intervallo minimo fra due piani
+    replan_cooldown: 4.0                       # [s]
+    replan_retry_period: 5.0                   # [s] dopo un fallimento
+    max_replan_failures: 3
